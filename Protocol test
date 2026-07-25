@@ -1,0 +1,3032 @@
+--[[
+	╔══════════════════════════════════════════════════════════════════════════╗
+	║              PROTOCOL X HUB — UI LIBRARY  v3.2  (bug-fix release)        ║
+	╠══════════════════════════════════════════════════════════════════════════╣
+	║  WHAT WAS BROKEN IN v3.1 AND IS FIXED HERE                               ║
+	║                                                                          ║
+	║   1. CRASH: Instance.new("UIDragDetector") errors on every client/       ║
+	║      executor that predates that class, killing the whole script before  ║
+	║      the window is shown. Replaced with a manual header drag that works  ║
+	║      with mouse AND touch, and no longer fights sliders/toggles.         ║
+	║   2. Keybind labels printed "Enum.KeyCode.RightControl" because          ║
+	║      FormatKey used type() instead of typeof().                          ║
+	║   3. Sliders stacked a NEW UIStroke on both handles on every theme       ║
+	║      change (memory + visual artefacts). Strokes are reused now.         ║
+	║   4. The active-tab indicator bar was turned ON but never OFF, so every  ║
+	║      visited tab kept an accent bar.                                     ║
+	║   5. Dropdown / theme popups only closed on MouseButton1 -> on mobile    ║
+	║      they could never be dismissed by tapping outside.                   ║
+	║   6. Dropdown menu was a clipped Frame: option lists longer than ~6      ║
+	║      items were unreachable. It is a ScrollingFrame now, and the         ║
+	║      documented `Search = true` option is actually implemented.          ║
+	║   7. The outside-click handler for the theme popup was registered twice. ║
+	║   8. Notifications: their ScreenGui had no DisplayOrder so they rendered ║
+	║      UNDER the window; the close animation tweened Position inside a     ║
+	║      UIListLayout (which does nothing); 300px wide off-screen on phones; ║
+	║      text was clipped. Rewritten with auto height + fade out.            ║
+	║   9. Window size was hard-coded (420x340 / 780x520) and could be bigger  ║
+	║      than the actual viewport. Sizing is viewport-relative and re-clamps ║
+	║      when the screen rotates/resizes.                                    ║
+	║  10. Home page was reachable only once: no way back after opening a tab. ║
+	║      There is a Home button in the sidebar now.                          ║
+	║  11. Re-running the script stacked GUIs; the floating button could never ║
+	║      be re-created after :Destroy(). Old GUIs are cleaned up on load.    ║
+	║  12. Theme callbacks were never released and were fired for destroyed    ║
+	║      instances; they are pruned now (and errors no longer kill the rest).║
+	║  13. Button text used Theme.Main which is invisible on some accents;     ║
+	║      text colour is now picked from the accent's luminance.              ║
+	║  14. `Reset All` in the Config tab only showed a notification. It now    ║
+	║      really restores every component's default value.                    ║
+	║  15. Config save/load ignored dropdown/multi values, the theme and the   ║
+	║      toggle key, and readfile() was called even when no file existed.    ║
+	║  16. Component constructors errored when called without a table          ║
+	║      (Tab:Toggle() etc.) and Toggle/Slider never fired the callback for  ║
+	║      their default value.                                                ║
+	║  17. Floating-button drag never stopped if the finger/mouse was released ║
+	║      outside the button, and the 5s hold-to-lock also dragged the button.║
+	║  18. Search: results kept the old tab visible, "no results" label was    ║
+	║      mis-parented, and descriptions were not searchable.                 ║
+	║  19. A saved keybind came back as an empty table (type() sees an         ║
+	║      EnumItem as userdata, so it hit the wrong branch) which silently    ║
+	║      destroyed the GUI toggle key after Load Config.                     ║
+	║  20. Clients without CanvasGroup now fall back to Frame instead of       ║
+	║      erroring on GroupTransparency.                                      ║
+	║                                                                          ║
+	║  API is 100% backwards compatible with v3.1 — additive only.             ║
+	╚══════════════════════════════════════════════════════════════════════════╝
+
+	QUICK START
+	-----------
+	local Library = loadstring(game:HttpGet("<raw url>"))()
+
+	local Win = Library:Window({
+		Title = "Protocol X Hub",
+		SubTitle = "by you",
+		Logo = "rbxassetid://0",
+		FloatingButton = true,           -- mobile-friendly open/close button
+	})
+
+	local Main = Win:Tab({ Title = "Main", Icon = "rbxassetid://10723407389" })
+	Main:Section({ Title = "Combat" })
+	Main:Toggle({ Title = "Aimbot", Default = false, Callback = function(v) print(v) end })
+	Main:Slider({ Title = "FOV", Min = 10, Max = 500, Default = 120, Callback = print })
+	Main:Dropdown({ Title = "Target", Options = {"Head","Torso"}, Default = "Head", Callback = print })
+	Main:Button({ Title = "Rejoin", Action = "Go", Callback = function() end })
+]]
+
+--// ================================================================
+--//  SERVICES
+--// ================================================================
+local Players          = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui          = game:GetService("CoreGui")
+local RunService       = game:GetService("RunService")
+local TweenService     = game:GetService("TweenService")
+local TextService      = game:GetService("TextService")
+local HttpService      = game:GetService("HttpService")
+
+local LocalPlayer = Players.LocalPlayer
+
+--// Viewport helpers -------------------------------------------------
+local function GetCamera()
+	return workspace and workspace.CurrentCamera or nil
+end
+
+local function Viewport()
+	local cam = GetCamera()
+	local vp = cam and cam.ViewportSize
+	if not vp or vp.X < 1 or vp.Y < 1 then
+		return Vector2.new(1280, 720)
+	end
+	return vp
+end
+
+--// FIX #9: treat small viewports as mobile too (tablets / emulators / small
+--// windows), instead of relying on TouchEnabled alone.
+local function DetectMobile()
+	local touch = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+	local vp = Viewport()
+	return touch or math.min(vp.X, vp.Y) < 460
+end
+
+local IsMobile = DetectMobile()
+
+--// FIX #11: some executors cannot parent to CoreGui; and re-running the
+--// script must not stack a second UI on top of the old one.
+local function GuiParent()
+	local ok, hidden = pcall(function()
+		return gethui and gethui() or nil
+	end)
+	if ok and hidden then return hidden end
+	local canCore = pcall(function() return CoreGui:GetChildren() end)
+	if canCore then return CoreGui end
+	return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local function DestroyOld(name)
+	for _, container in ipairs({ GuiParent(), LocalPlayer:FindFirstChild("PlayerGui") }) do
+		if container then
+			local old = container:FindFirstChild(name)
+			while old do
+				old:Destroy()
+				old = container:FindFirstChild(name)
+			end
+		end
+	end
+end
+
+--// ================================================================
+--//  TWEEN PRESETS
+--// ================================================================
+local TF  = TweenInfo.new(0.15, Enum.EasingStyle.Quad,  Enum.EasingDirection.Out)
+local TS  = TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+local TB  = TweenInfo.new(0.35, Enum.EasingStyle.Back,  Enum.EasingDirection.Out)
+local T0  = TweenInfo.new(0.05)
+
+local function Tw(obj, props, info)
+	if not obj then return nil end
+	local ok, tween = pcall(function()
+		return TweenService:Create(obj, info or TS, props)
+	end)
+	if not ok or not tween then return nil end
+	tween:Play()
+	return tween
+end
+
+local TwFade -- defined once CanvasGroup support is known
+
+--// ================================================================
+--//  THEMES
+--// ================================================================
+local Themes = {
+	["GitHub Dark"] = {
+		Body=Color3.fromRGB(13,17,23), Sidebar=Color3.fromRGB(1,4,9),
+		Main=Color3.fromRGB(22,27,34), Search=Color3.fromRGB(13,17,23),
+		TextPrimary=Color3.fromRGB(230,237,243), TextSecondary=Color3.fromRGB(139,148,158),
+		Accent=Color3.fromRGB(47,129,247), Border=Color3.fromRGB(48,54,61),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Tokyo Night"] = {
+		Body=Color3.fromRGB(26,27,38), Sidebar=Color3.fromRGB(22,22,30),
+		Main=Color3.fromRGB(26,27,38), Search=Color3.fromRGB(41,46,66),
+		TextPrimary=Color3.fromRGB(192,202,245), TextSecondary=Color3.fromRGB(86,95,137),
+		Accent=Color3.fromRGB(122,162,247), Border=Color3.fromRGB(56,62,90),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Catppuccin Mocha"] = {
+		Body=Color3.fromRGB(30,30,46), Sidebar=Color3.fromRGB(17,17,27),
+		Main=Color3.fromRGB(30,30,46), Search=Color3.fromRGB(49,50,68),
+		TextPrimary=Color3.fromRGB(205,214,244), TextSecondary=Color3.fromRGB(166,173,200),
+		Accent=Color3.fromRGB(203,166,247), Border=Color3.fromRGB(69,71,90),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Rose Pine"] = {
+		Body=Color3.fromRGB(25,23,36), Sidebar=Color3.fromRGB(31,29,46),
+		Main=Color3.fromRGB(38,35,58), Search=Color3.fromRGB(64,61,82),
+		TextPrimary=Color3.fromRGB(224,222,244), TextSecondary=Color3.fromRGB(144,140,170),
+		Accent=Color3.fromRGB(235,188,186), Border=Color3.fromRGB(72,69,92),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Nord Frost"] = {
+		Body=Color3.fromRGB(46,52,64), Sidebar=Color3.fromRGB(59,66,82),
+		Main=Color3.fromRGB(46,52,64), Search=Color3.fromRGB(67,76,94),
+		TextPrimary=Color3.fromRGB(236,239,244), TextSecondary=Color3.fromRGB(129,161,193),
+		Accent=Color3.fromRGB(136,192,208), Border=Color3.fromRGB(76,86,106),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Dracula Vampire"] = {
+		Body=Color3.fromRGB(40,42,54), Sidebar=Color3.fromRGB(33,34,44),
+		Main=Color3.fromRGB(40,42,54), Search=Color3.fromRGB(68,71,90),
+		TextPrimary=Color3.fromRGB(248,248,242), TextSecondary=Color3.fromRGB(144,144,144),
+		Accent=Color3.fromRGB(189,147,249), Border=Color3.fromRGB(98,114,164),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Deep Sea"] = {
+		Body=Color3.fromRGB(5,15,25), Sidebar=Color3.fromRGB(10,25,40),
+		Main=Color3.fromRGB(15,35,55), Search=Color3.fromRGB(25,50,75),
+		TextPrimary=Color3.fromRGB(255,255,255), TextSecondary=Color3.fromRGB(100,160,220),
+		Accent=Color3.fromRGB(0,210,255), Border=Color3.fromRGB(30,70,110),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Linear Dark"] = {
+		Body=Color3.fromRGB(12,12,14), Sidebar=Color3.fromRGB(18,18,20),
+		Main=Color3.fromRGB(12,12,14), Search=Color3.fromRGB(25,25,28),
+		TextPrimary=Color3.fromRGB(239,239,241), TextSecondary=Color3.fromRGB(138,138,142),
+		Accent=Color3.fromRGB(94,106,210), Border=Color3.fromRGB(35,35,39),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Amethyst Deep"] = {
+		Body=Color3.fromRGB(18,14,24), Sidebar=Color3.fromRGB(25,20,34),
+		Main=Color3.fromRGB(18,14,24), Search=Color3.fromRGB(35,28,47),
+		TextPrimary=Color3.fromRGB(255,255,255), TextSecondary=Color3.fromRGB(163,148,184),
+		Accent=Color3.fromRGB(191,123,255), Border=Color3.fromRGB(48,39,64),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Crimson Edge"] = {
+		Body=Color3.fromRGB(15,10,10), Sidebar=Color3.fromRGB(22,14,14),
+		Main=Color3.fromRGB(15,10,10), Search=Color3.fromRGB(31,20,20),
+		TextPrimary=Color3.fromRGB(255,245,245), TextSecondary=Color3.fromRGB(184,148,148),
+		Accent=Color3.fromRGB(255,77,77), Border=Color3.fromRGB(51,31,31),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Cyber Orange"] = {
+		Body=Color3.fromRGB(10,10,10), Sidebar=Color3.fromRGB(18,18,18),
+		Main=Color3.fromRGB(10,10,10), Search=Color3.fromRGB(28,28,28),
+		TextPrimary=Color3.fromRGB(255,255,255), TextSecondary=Color3.fromRGB(150,150,150),
+		Accent=Color3.fromRGB(255,165,0), Border=Color3.fromRGB(40,40,40),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Midnight Forest"] = {
+		Body=Color3.fromRGB(15,20,18), Sidebar=Color3.fromRGB(22,28,25),
+		Main=Color3.fromRGB(15,20,18), Search=Color3.fromRGB(35,45,40),
+		TextPrimary=Color3.fromRGB(230,240,235), TextSecondary=Color3.fromRGB(140,160,150),
+		Accent=Color3.fromRGB(100,255,150), Border=Color3.fromRGB(45,55,50),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Obsidian Purple"] = {
+		Body=Color3.fromRGB(18,18,18), Sidebar=Color3.fromRGB(25,25,25),
+		Main=Color3.fromRGB(18,18,18), Search=Color3.fromRGB(32,32,32),
+		TextPrimary=Color3.fromRGB(255,255,255), TextSecondary=Color3.fromRGB(160,160,160),
+		Accent=Color3.fromRGB(113,89,234), Border=Color3.fromRGB(45,45,45),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Deep Space"] = {
+		Body=Color3.fromRGB(8,10,15), Sidebar=Color3.fromRGB(12,15,22),
+		Main=Color3.fromRGB(8,10,15), Search=Color3.fromRGB(20,25,35),
+		TextPrimary=Color3.fromRGB(240,245,255), TextSecondary=Color3.fromRGB(120,135,160),
+		Accent=Color3.fromRGB(90,140,255), Border=Color3.fromRGB(30,35,50),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Tonal Slate"] = {
+		Body=Color3.fromRGB(15,23,31), Sidebar=Color3.fromRGB(30,41,51),
+		Main=Color3.fromRGB(15,23,31), Search=Color3.fromRGB(30,41,51),
+		TextPrimary=Color3.fromRGB(241,245,249), TextSecondary=Color3.fromRGB(148,163,184),
+		Accent=Color3.fromRGB(56,189,248), Border=Color3.fromRGB(51,65,85),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Gruvbox Hard"] = {
+		Body=Color3.fromRGB(40,40,40), Sidebar=Color3.fromRGB(28,28,28),
+		Main=Color3.fromRGB(40,40,40), Search=Color3.fromRGB(50,48,47),
+		TextPrimary=Color3.fromRGB(235,219,178), TextSecondary=Color3.fromRGB(168,153,132),
+		Accent=Color3.fromRGB(254,128,25), Border=Color3.fromRGB(60,56,54),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Everforest Dark"] = {
+		Body=Color3.fromRGB(45,53,59), Sidebar=Color3.fromRGB(43,49,54),
+		Main=Color3.fromRGB(51,59,64), Search=Color3.fromRGB(61,70,75),
+		TextPrimary=Color3.fromRGB(211,216,183), TextSecondary=Color3.fromRGB(133,146,137),
+		Accent=Color3.fromRGB(167,192,128), Border=Color3.fromRGB(71,82,88),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Arc Midnight"] = {
+		Body=Color3.fromRGB(14,16,22), Sidebar=Color3.fromRGB(20,24,35),
+		Main=Color3.fromRGB(14,16,22), Search=Color3.fromRGB(31,37,54),
+		TextPrimary=Color3.fromRGB(255,255,255), TextSecondary=Color3.fromRGB(120,132,164),
+		Accent=Color3.fromRGB(77,153,255), Border=Color3.fromRGB(42,48,68),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Twitch Dark"] = {
+		Body=Color3.fromRGB(14,14,16), Sidebar=Color3.fromRGB(24,24,27),
+		Main=Color3.fromRGB(14,14,16), Search=Color3.fromRGB(31,31,35),
+		TextPrimary=Color3.fromRGB(239,239,241), TextSecondary=Color3.fromRGB(173,173,184),
+		Accent=Color3.fromRGB(145,71,255), Border=Color3.fromRGB(38,38,44),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Shadcn"] = {
+		Body=Color3.fromRGB(0,0,0), Sidebar=Color3.fromRGB(9,9,11),
+		Main=Color3.fromRGB(0,0,0), Search=Color3.fromRGB(24,24,27),
+		TextPrimary=Color3.fromRGB(250,250,250), TextSecondary=Color3.fromRGB(161,161,170),
+		Accent=Color3.fromRGB(255,255,255), Border=Color3.fromRGB(39,39,42),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Linear Light"] = {
+		Body=Color3.fromRGB(255,255,255), Sidebar=Color3.fromRGB(247,248,250),
+		Main=Color3.fromRGB(255,255,255), Search=Color3.fromRGB(238,239,242),
+		TextPrimary=Color3.fromRGB(17,17,19), TextSecondary=Color3.fromRGB(110,111,114),
+		Accent=Color3.fromRGB(94,106,210), Border=Color3.fromRGB(225,226,230),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Vanilla Latte"] = {
+		Body=Color3.fromRGB(245,240,235), Sidebar=Color3.fromRGB(235,230,225),
+		Main=Color3.fromRGB(255,255,255), Search=Color3.fromRGB(240,235,230),
+		TextPrimary=Color3.fromRGB(50,45,40), TextSecondary=Color3.fromRGB(140,130,120),
+		Accent=Color3.fromRGB(180,150,120), Border=Color3.fromRGB(215,205,195),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Matcha Tea"] = {
+		Body=Color3.fromRGB(28,30,28), Sidebar=Color3.fromRGB(34,38,34),
+		Main=Color3.fromRGB(28,30,28), Search=Color3.fromRGB(45,51,45),
+		TextPrimary=Color3.fromRGB(235,245,235), TextSecondary=Color3.fromRGB(150,165,150),
+		Accent=Color3.fromRGB(120,180,120), Border=Color3.fromRGB(60,70,60),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Rose Quartz"] = {
+		Body=Color3.fromRGB(250,245,247), Sidebar=Color3.fromRGB(240,230,235),
+		Main=Color3.fromRGB(255,255,255), Search=Color3.fromRGB(245,235,240),
+		TextPrimary=Color3.fromRGB(80,60,70), TextSecondary=Color3.fromRGB(160,140,150),
+		Accent=Color3.fromRGB(255,180,200), Border=Color3.fromRGB(230,210,220),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Sahara Dust"] = {
+		Body=Color3.fromRGB(34,30,26), Sidebar=Color3.fromRGB(26,23,20),
+		Main=Color3.fromRGB(34,30,26), Search=Color3.fromRGB(45,40,35),
+		TextPrimary=Color3.fromRGB(245,240,230), TextSecondary=Color3.fromRGB(160,150,140),
+		Accent=Color3.fromRGB(225,175,110), Border=Color3.fromRGB(60,55,50),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Bordeaux"] = {
+		Body=Color3.fromRGB(20,10,12), Sidebar=Color3.fromRGB(28,15,18),
+		Main=Color3.fromRGB(20,10,12), Search=Color3.fromRGB(45,20,25),
+		TextPrimary=Color3.fromRGB(255,240,240), TextSecondary=Color3.fromRGB(180,130,135),
+		Accent=Color3.fromRGB(230,50,70), Border=Color3.fromRGB(60,30,35),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Ghost in the Shell"] = {
+		Body=Color3.fromRGB(10,15,20), Sidebar=Color3.fromRGB(15,25,30),
+		Main=Color3.fromRGB(20,30,35), Search=Color3.fromRGB(30,45,50),
+		TextPrimary=Color3.fromRGB(150,255,240), TextSecondary=Color3.fromRGB(100,180,170),
+		Accent=Color3.fromRGB(0,255,200), Border=Color3.fromRGB(40,60,65),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Paper Dark"] = {
+		Body=Color3.fromRGB(30,32,35), Sidebar=Color3.fromRGB(25,27,30),
+		Main=Color3.fromRGB(30,32,35), Search=Color3.fromRGB(40,42,45),
+		TextPrimary=Color3.fromRGB(220,225,230), TextSecondary=Color3.fromRGB(130,135,140),
+		Accent=Color3.fromRGB(200,200,200), Border=Color3.fromRGB(60,62,65),
+		Font=Enum.Font.GothamMedium,
+	},
+	["Midnight"] = {
+		Body=Color3.fromRGB(12,14,20), Sidebar=Color3.fromRGB(18,22,32),
+		Main=Color3.fromRGB(14,16,23), Search=Color3.fromRGB(26,30,43),
+		TextPrimary=Color3.fromRGB(255,255,255), TextSecondary=Color3.fromRGB(115,126,158),
+		Accent=Color3.fromRGB(70,145,255), Border=Color3.fromRGB(38,44,65),
+		Font=Enum.Font.GothamMedium,
+	},
+}
+
+--// ================================================================
+--//  HELPERS
+--// ================================================================
+local function New(cls, props)
+	local ok, o = pcall(Instance.new, cls)
+	if not ok or not o then
+		warn(("[PXHub] this client cannot create a %q instance"):format(tostring(cls)))
+		return nil
+	end
+	props = props or {}
+	for k, v in pairs(props) do
+		if k ~= "Parent" then
+			local set = pcall(function() o[k] = v end)
+			if not set then
+				warn(("[PXHub] could not set %s.%s"):format(cls, tostring(k)))
+			end
+		end
+	end
+	if props.Parent then o.Parent = props.Parent end
+	return o
+end
+
+--// Very old clients have no CanvasGroup: fall back to a plain Frame and skip
+--// the group fades instead of erroring on GroupTransparency.
+local CanvasOK = pcall(function()
+	local probe = Instance.new("CanvasGroup")
+	probe:Destroy()
+end)
+local CanvasClass = CanvasOK and "CanvasGroup" or "Frame"
+
+local function SetFade(obj, v)
+	if not obj then return end
+	if CanvasOK then obj.GroupTransparency = v else obj.Visible = v < 1 end
+end
+
+function TwFade(obj, v, info)
+	if not obj then return nil end
+	if CanvasOK then return Tw(obj, { GroupTransparency = v }, info) end
+	obj.Visible = v < 1
+	return nil
+end
+
+local function Corner(p, r)    return New("UICorner",  { CornerRadius = UDim.new(0, r or 8), Parent = p }) end
+local function Stroke(p, c, t) return New("UIStroke",  { Color = c or Color3.new(), Thickness = t or 1, Parent = p }) end
+local function Pad(p, t, b, l, r)
+	return New("UIPadding", {
+		PaddingTop = UDim.new(0, t or 0), PaddingBottom = UDim.new(0, b or 0),
+		PaddingLeft = UDim.new(0, l or 0), PaddingRight = UDim.new(0, r or 0), Parent = p,
+	})
+end
+local function List(p, pad, fd, ha, va)
+	return New("UIListLayout", {
+		SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, pad or 0),
+		FillDirection = fd or Enum.FillDirection.Vertical,
+		HorizontalAlignment = ha or Enum.HorizontalAlignment.Left,
+		VerticalAlignment = va or Enum.VerticalAlignment.Top, Parent = p,
+	})
+end
+
+--// FIX #2: typeof(), not type() — Roblox enums are userdata to type().
+local function FormatKey(k)
+	if not k then return "None" end
+	local n
+	if typeof(k) == "EnumItem" then
+		n = k.Name
+	else
+		n = tostring(k):gsub("^Enum%.%w+%.", "")
+	end
+	local m = {
+		MouseButton1 = "MB1", MouseButton2 = "MB2", MouseButton3 = "MB3",
+		LeftShift = "LShift", RightShift = "RShift",
+		LeftControl = "LCtrl", RightControl = "RCtrl",
+		LeftAlt = "LAlt", RightAlt = "RAlt",
+	}
+	return m[n] or n
+end
+
+--// FIX #13: readable text on top of any accent colour.
+local function Luminance(c)
+	return 0.299 * c.R + 0.587 * c.G + 0.114 * c.B
+end
+local function ContrastOn(color)
+	return Luminance(color) > 0.6 and Color3.fromRGB(12, 12, 14) or Color3.fromRGB(255, 255, 255)
+end
+
+local function TextWidth(text, size, font, maxW)
+	local ok, res = pcall(function()
+		return TextService:GetTextSize(text, size, font, Vector2.new(maxW or 10000, 10000))
+	end)
+	if ok and res then return res.X, res.Y end
+	return #tostring(text) * size * 0.55, size + 4
+end
+
+--// Every connection the library makes is tracked so :Unload() is clean.
+local Connections = {}
+local function Bind(signal, fn)
+	local c = signal:Connect(fn)
+	table.insert(Connections, c)
+	return c
+end
+
+--// ================================================================
+--//  LIBRARY STATE
+--// ================================================================
+local Library = {
+	ToggleKey    = Enum.KeyCode.RightControl,
+	Flags        = {},
+	CurrentTheme = "GitHub Dark",
+	Version      = "3.2.0",
+	IsMobile     = IsMobile,
+	Windows      = {},
+	ConfigFile   = "ProtocolXHub_Config.json",
+}
+
+local Theme    = Themes["GitHub Dark"]
+local ThemeCBs = {}
+
+--// FIX #12: theme listeners can be released, dead ones are pruned and a
+--// throwing listener no longer aborts the remaining ones.
+local function OnTheme(fn, guard)
+	local entry = { fn = fn, guard = guard }
+	table.insert(ThemeCBs, entry)
+	return entry
+end
+
+local function FireTheme()
+	for i = #ThemeCBs, 1, -1 do
+		local e = ThemeCBs[i]
+		local dead = false
+		if e.guard then
+			local ok, parent = pcall(function() return e.guard.Parent end)
+			dead = (not ok) or parent == nil
+		end
+		if dead then
+			table.remove(ThemeCBs, i)
+		else
+			local ok, err = pcall(e.fn)
+			if not ok then
+				warn("[PXHub] theme listener failed: " .. tostring(err))
+				table.remove(ThemeCBs, i)
+			end
+		end
+	end
+end
+
+function Library:SetTheme(name)
+	if not Themes[name] then
+		warn("[PXHub] unknown theme: " .. tostring(name))
+		return false
+	end
+	Theme = Themes[name]
+	self.CurrentTheme = name
+	FireTheme()
+	return true
+end
+
+function Library:GetTheme() return Theme end
+
+function Library:GetThemes()
+	local t = {}
+	for k in pairs(Themes) do table.insert(t, k) end
+	table.sort(t)
+	return t
+end
+
+function Library:AddTheme(name, def)
+	if type(name) ~= "string" or type(def) ~= "table" then return false end
+	local base = Themes["GitHub Dark"]
+	local merged = {}
+	for k, v in pairs(base) do merged[k] = v end
+	for k, v in pairs(def) do merged[k] = v end
+	Themes[name] = merged
+	return true
+end
+
+function Library:SetWindowKeybind(k) self.ToggleKey = k end
+
+--// Convenience: Library:GetFlag("Main/Aimbot") -> current value
+function Library:GetFlag(name)
+	local f = self.Flags[name]
+	if f and type(f.GetValue) == "function" then
+		local ok, v = pcall(f.GetValue, f)
+		if ok then return v end
+	end
+	return nil
+end
+
+function Library:SetFlag(name, value)
+	local f = self.Flags[name]
+	if f and type(f.SetValue) == "function" then
+		return pcall(f.SetValue, f, value)
+	end
+	return false
+end
+
+--// ================================================================
+--//  NOTIFICATIONS   (FIX #8)
+--// ================================================================
+local _NotifGui, _NotifList
+
+local function EnsureNotif()
+	if _NotifGui and _NotifGui.Parent then return end
+	DestroyOld("PXH_Notifs") -- FIX #11: never stack two notification layers
+	_NotifGui = New("ScreenGui", {
+		Name = "PXH_Notifs", ResetOnSpawn = false, IgnoreGuiInset = true,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+		DisplayOrder = 1000, -- above the window (the window uses 100)
+	})
+	_NotifGui.Parent = GuiParent()
+
+	local width = math.min(300, math.max(180, Viewport().X * 0.42))
+	_NotifList = New("Frame", {
+		Name = "Stack",
+		Size = UDim2.new(0, width, 1, -20),
+		Position = UDim2.new(1, -(width + 10), 0, 10),
+		BackgroundTransparency = 1, Parent = _NotifGui,
+	})
+	List(_NotifList, 8, Enum.FillDirection.Vertical,
+		Enum.HorizontalAlignment.Right, Enum.VerticalAlignment.Bottom)
+
+	local cam = GetCamera()
+	if cam then
+		Bind(cam:GetPropertyChangedSignal("ViewportSize"), function()
+			if not _NotifList or not _NotifList.Parent then return end
+			local w = math.min(300, math.max(180, Viewport().X * 0.42))
+			_NotifList.Size = UDim2.new(0, w, 1, -20)
+			_NotifList.Position = UDim2.new(1, -(w + 10), 0, 10)
+		end)
+	end
+end
+
+local function Notify(opts)
+	if type(opts) == "string" then opts = { Content = opts } end
+	opts = opts or {}
+	EnsureNotif()
+
+	local title   = opts.Title    or "Notice"
+	local content = opts.Content  or ""
+	local dur     = tonumber(opts.Duration) or 3
+	local ntype   = opts.Type     or "Info"
+	local cols = {
+		Info    = Color3.fromRGB(47, 129, 247),
+		Success = Color3.fromRGB(46, 200, 110),
+		Warning = Color3.fromRGB(240, 190, 0),
+		Error   = Color3.fromRGB(230, 70, 60),
+	}
+	local col = cols[ntype] or cols.Info
+
+	local cardW = _NotifList.AbsoluteSize.X
+	if cardW < 50 then cardW = math.min(300, math.max(180, Viewport().X * 0.42)) end
+
+	-- height follows the content instead of clipping it
+	local _, textH = TextWidth(content, 11, Theme.Font, cardW - 40)
+	local cardH = math.clamp(38 + math.max(textH, 14), 58, 160)
+
+	local card = New(CanvasClass, {
+		Size = UDim2.new(1, 0, 0, 0), BackgroundColor3 = Theme.Main,
+		GroupTransparency = 0, ClipsDescendants = true, Parent = _NotifList,
+	})
+	Corner(card, 8)
+	Stroke(card, Theme.Border, 1)
+
+	local topLine = New("Frame", { Size = UDim2.new(1, 0, 0, 2), BackgroundColor3 = col,
+		BorderSizePixel = 0, ZIndex = 2, Parent = card })
+	New("UIGradient", { Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.1, 0),
+		NumberSequenceKeypoint.new(0.9, 0), NumberSequenceKeypoint.new(1, 1) }), Parent = topLine })
+
+	local sideBar = New("Frame", { Size = UDim2.new(0, 3, 1, -16), Position = UDim2.new(0, 8, 0, 8),
+		BackgroundColor3 = col, BorderSizePixel = 0, ZIndex = 2, Parent = card })
+	Corner(sideBar, 2)
+
+	New("TextLabel", { Size = UDim2.new(1, -46, 0, 18), Position = UDim2.new(0, 20, 0, 9),
+		BackgroundTransparency = 1, Text = title, TextColor3 = Theme.TextPrimary,
+		Font = Enum.Font.GothamBold, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 2, Parent = card })
+
+	New("TextLabel", { Size = UDim2.new(1, -30, 0, cardH - 36), Position = UDim2.new(0, 20, 0, 29),
+		BackgroundTransparency = 1, Text = content, TextColor3 = Theme.TextSecondary,
+		Font = Theme.Font, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true, ZIndex = 2, Parent = card })
+
+	local closeB = New("TextButton", { Size = UDim2.new(0, 20, 0, 20), Position = UDim2.new(1, -26, 0, 8),
+		BackgroundTransparency = 1, Text = "✕", TextColor3 = Theme.TextSecondary,
+		Font = Enum.Font.GothamBold, TextSize = 12, ZIndex = 3, Parent = card })
+
+	local prog = New("Frame", { Size = UDim2.new(1, 0, 0, 2), Position = UDim2.new(0, 0, 1, -2),
+		BackgroundColor3 = col, BorderSizePixel = 0, ZIndex = 2, Parent = card })
+
+	Tw(card, { Size = UDim2.new(1, 0, 0, cardH) }, TB)
+	Tw(prog, { Size = UDim2.new(0, 0, 0, 2) }, TweenInfo.new(dur, Enum.EasingStyle.Linear))
+
+	local closed = false
+	local function Close()
+		if closed then return end
+		closed = true
+		-- FIX: a UIListLayout owns Position, so fade + collapse instead.
+		TwFade(card, 1, TS)
+		Tw(card, { Size = UDim2.new(1, 0, 0, 0) }, TS)
+		task.delay(0.3, function()
+			if card and card.Parent then card:Destroy() end
+		end)
+	end
+	closeB.MouseButton1Click:Connect(Close)
+	task.delay(dur, Close)
+
+	return { Close = Close, Card = card }
+end
+
+--// tolerate both Library.Notify(opts) and Library:Notify(opts)
+Library.Notify = function(a, b)
+	if a == Library then return Notify(b) end
+	return Notify(a)
+end
+
+--// ================================================================
+--//  FLOATING BUTTON   (FIX #11, #17)
+--// ================================================================
+local _FloatBtn = nil
+
+local function CreateFloatingButton(opts)
+	if _FloatBtn and _FloatBtn.Gui and _FloatBtn.Gui.Parent then
+		-- already exists: re-wire the click handler instead of stacking a copy
+		if opts and opts.OnClick then _FloatBtn:SetCallback(opts.OnClick) end
+		return _FloatBtn
+	end
+
+	opts = opts or {}
+	local Logo     = opts.Logo     or ""
+	local Title    = opts.Title    or "Protocol X Hub"
+	local OnClick  = opts.OnClick  or function() end
+
+	DestroyOld("PXH_FloatBtn")
+
+	local FBGui = New("ScreenGui", {
+		Name = "PXH_FloatBtn", ResetOnSpawn = false, IgnoreGuiInset = true,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 900,
+	})
+	FBGui.Parent = GuiParent()
+
+	local BtnSize = IsMobile and 58 or 72
+	local vp = Viewport()
+
+	local GlowFrame = New("Frame", {
+		Size = UDim2.fromOffset(BtnSize + 20, BtnSize + 20),
+		Position = UDim2.fromOffset(math.floor(vp.X * 0.02), math.floor(vp.Y * 0.45)),
+		BackgroundTransparency = 1, Parent = FBGui,
+	})
+
+	local GlowImg = New("ImageLabel", {
+		Size = UDim2.new(1, 20, 1, 20), Position = UDim2.new(0, -10, 0, -10),
+		BackgroundTransparency = 1, Image = "rbxassetid://6015897843",
+		ImageColor3 = Theme.Accent, ImageTransparency = 0.6,
+		ScaleType = Enum.ScaleType.Slice, SliceCenter = Rect.new(49, 49, 450, 450),
+		ZIndex = 0, Parent = GlowFrame,
+	})
+
+	local MainBtn = New("ImageButton", {
+		Size = UDim2.fromOffset(BtnSize, BtnSize),
+		Position = UDim2.new(0.5, -(BtnSize / 2), 0.5, -(BtnSize / 2)),
+		BackgroundColor3 = Theme.Main, Image = "", AutoButtonColor = false,
+		ZIndex = 2, Parent = GlowFrame,
+	})
+	Corner(MainBtn, IsMobile and 14 or 16)
+	local BtnStroke = Stroke(MainBtn, Theme.Accent, 2)
+
+	local LogoImg = New("ImageLabel", {
+		Size = UDim2.fromOffset(BtnSize - 22, BtnSize - 26),
+		Position = UDim2.fromOffset(11, 8),
+		BackgroundTransparency = 1, Image = Logo,
+		ScaleType = Enum.ScaleType.Fit, ZIndex = 4, Parent = MainBtn,
+	})
+
+	local TitleLbl = New("TextLabel", {
+		Size = UDim2.new(1, -6, 0, 12), Position = UDim2.new(0, 3, 1, -14),
+		BackgroundTransparency = 1, Text = Title,
+		TextColor3 = Color3.new(1, 1, 1), TextTransparency = 0.15,
+		Font = Enum.Font.GothamBold, TextSize = IsMobile and 7 or 8,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		TextXAlignment = Enum.TextXAlignment.Center, ZIndex = 5, Parent = MainBtn,
+	})
+
+	local LockDot = New("Frame", {
+		Size = UDim2.fromOffset(14, 14), Position = UDim2.new(1, -4, 0, -4),
+		BackgroundColor3 = Color3.fromRGB(255, 200, 0),
+		BorderSizePixel = 0, ZIndex = 6, Visible = false, Parent = MainBtn,
+	})
+	Corner(LockDot, 7)
+
+	local isLocked, isDragging, moved = false, false, false
+	local holdStart, holdConn = 0, nil
+	local dragOffset = Vector2.new()
+	local callback = OnClick
+
+	local function SetLock(locked, silent)
+		isLocked = locked
+		LockDot.Visible = locked
+		BtnStroke.Color = locked and Color3.fromRGB(255, 200, 0) or Theme.Accent
+		GlowImg.ImageColor3 = locked and Color3.fromRGB(255, 200, 0) or Theme.Accent
+		if not silent then
+			Notify({
+				Title = locked and "Button Locked" or "Button Unlocked",
+				Content = locked and "Hold 5s again to unlock." or "You can drag it again.",
+				Type = "Warning", Duration = 2,
+			})
+		end
+	end
+
+	local function ClampIntoScreen()
+		local sc = FBGui.AbsoluteSize
+		if sc.X < 1 then return end
+		local gsz = GlowFrame.AbsoluteSize
+		local p = GlowFrame.AbsolutePosition
+		GlowFrame.Position = UDim2.fromOffset(
+			math.clamp(p.X, 0, math.max(0, sc.X - gsz.X)),
+			math.clamp(p.Y, 0, math.max(0, sc.Y - gsz.Y))
+		)
+	end
+
+	MainBtn.InputBegan:Connect(function(inp)
+		if inp.UserInputType ~= Enum.UserInputType.MouseButton1
+			and inp.UserInputType ~= Enum.UserInputType.Touch then return end
+
+		moved = false
+		holdStart = tick()
+		if holdConn then holdConn:Disconnect() end
+		holdConn = RunService.RenderStepped:Connect(function()
+			if (tick() - holdStart) >= 5 then
+				if holdConn then holdConn:Disconnect(); holdConn = nil end
+				isDragging = false          -- FIX #17: stop dragging when it locks
+				SetLock(not isLocked)
+			end
+		end)
+
+		if not isLocked then
+			isDragging = true
+			local gp = GlowFrame.AbsolutePosition
+			dragOffset = Vector2.new(inp.Position.X - gp.X, inp.Position.Y - gp.Y)
+		end
+	end)
+
+	--// FIX #17: release is tracked globally, not only over the button.
+	Bind(UserInputService.InputEnded, function(inp)
+		if inp.UserInputType ~= Enum.UserInputType.MouseButton1
+			and inp.UserInputType ~= Enum.UserInputType.Touch then return end
+		if holdConn then holdConn:Disconnect(); holdConn = nil end
+		local wasDragging = isDragging
+		isDragging = false
+		if not wasDragging and holdStart == 0 then return end
+		local elapsed = tick() - holdStart
+		holdStart = 0
+		if elapsed < 0.35 and not moved then
+			local ok, err = pcall(callback)
+			if not ok then warn("[PXHub] floating button callback error: " .. tostring(err)) end
+		else
+			ClampIntoScreen()
+		end
+	end)
+
+	Bind(UserInputService.InputChanged, function(inp)
+		if not isDragging or isLocked then return end
+		if inp.UserInputType ~= Enum.UserInputType.MouseMovement
+			and inp.UserInputType ~= Enum.UserInputType.Touch then return end
+		local sc  = FBGui.AbsoluteSize
+		local gsz = GlowFrame.AbsoluteSize
+		local nx  = math.clamp(inp.Position.X - dragOffset.X, 0, math.max(0, sc.X - gsz.X))
+		local ny  = math.clamp(inp.Position.Y - dragOffset.Y, 0, math.max(0, sc.Y - gsz.Y))
+		if math.abs(nx - GlowFrame.AbsolutePosition.X) > 2
+			or math.abs(ny - GlowFrame.AbsolutePosition.Y) > 2 then
+			moved = true
+		end
+		GlowFrame.Position = UDim2.fromOffset(nx, ny)
+	end)
+
+	Bind(RunService.RenderStepped, function()
+		if not isDragging and not isLocked and GlowImg.Parent then
+			GlowImg.ImageTransparency = 0.6 + math.sin(tick() * 2) * 0.15
+		end
+	end)
+
+	OnTheme(function()
+		GlowImg.ImageColor3      = isLocked and Color3.fromRGB(255, 200, 0) or Theme.Accent
+		BtnStroke.Color          = isLocked and Color3.fromRGB(255, 200, 0) or Theme.Accent
+		MainBtn.BackgroundColor3 = Theme.Main
+	end, MainBtn)
+
+	local cam = GetCamera()
+	if cam then Bind(cam:GetPropertyChangedSignal("ViewportSize"), ClampIntoScreen) end
+
+	local FBObj = { Frame = GlowFrame, Gui = FBGui, Button = MainBtn }
+	function FBObj:SetLogo(img)      LogoImg.Image = img end
+	function FBObj:SetTitle(t)       TitleLbl.Text = t end
+	function FBObj:SetVisible(v)     FBGui.Enabled = v end
+	function FBObj:SetCallback(fn)   callback = type(fn) == "function" and fn or callback end
+	function FBObj:SetLocked(v)      SetLock(v and true or false, true) end
+	function FBObj:IsLocked()        return isLocked end
+	function FBObj:Destroy()
+		if holdConn then holdConn:Disconnect(); holdConn = nil end
+		FBGui:Destroy()
+		_FloatBtn = nil -- FIX #11: allow creating a new one afterwards
+	end
+
+	_FloatBtn = FBObj
+	return FBObj
+end
+
+Library.CreateFloatingButton = function(a, b)
+	if a == Library then return CreateFloatingButton(b) end
+	return CreateFloatingButton(a)
+end
+
+--// ================================================================
+--//  MAIN WINDOW
+--// ================================================================
+function Library:Window(opts)
+	opts = opts or {}
+	local Logo     = opts.Logo     or ""
+	local Title    = opts.Title    or "Protocol X Hub"
+	local SubTitle = opts.SubTitle or "Welcome"
+	local Version  = opts.Version  or self.Version
+	if opts.Theme then self:SetTheme(opts.Theme) end
+	if opts.ToggleKey then self.ToggleKey = opts.ToggleKey end
+
+	DestroyOld("ProtocolXHub") -- FIX #11
+
+	--// FIX #9: responsive, viewport-relative sizing that never exceeds the screen
+	local function TargetSize()
+		local vp = Viewport()
+		local w, h
+		if IsMobile then
+			w = math.clamp(vp.X * 0.86, 260, 520)
+			h = math.clamp(vp.Y * 0.72, 220, 380)
+		else
+			w = math.clamp(vp.X * 0.55, 480, 820)
+			h = math.clamp(vp.Y * 0.62, 320, 560)
+		end
+		-- never larger than the viewport itself
+		w = math.min(w, vp.X - 16)
+		h = math.min(h, vp.Y - 16)
+		return math.floor(w), math.floor(h)
+	end
+
+	local W, H = TargetSize()
+	local SideW = IsMobile and 48 or 62
+
+	local ScreenGui = New("ScreenGui", {
+		Name = "ProtocolXHub", ResetOnSpawn = false, IgnoreGuiInset = true,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 100,
+	})
+	ScreenGui.Parent = GuiParent()
+
+	local Main = New(CanvasClass, {
+		Name = "Window",
+		Size = UDim2.fromOffset(W, H),
+		Position = UDim2.fromOffset(math.floor((Viewport().X - W) / 2), math.floor((Viewport().Y - H) / 2)),
+		BackgroundColor3 = Theme.Main, BorderSizePixel = 0,
+		GroupTransparency = 0, Parent = ScreenGui,
+	})
+	Corner(Main, 10)
+	local MainStroke = Stroke(Main, Theme.Border, 1)
+
+	local TopAccent = New("Frame", {
+		Size = UDim2.new(1, 0, 0, 2), BackgroundColor3 = Theme.Accent,
+		BorderSizePixel = 0, ZIndex = 10, Parent = Main,
+	})
+	New("UIGradient", { Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.05, 0),
+		NumberSequenceKeypoint.new(0.95, 0), NumberSequenceKeypoint.new(1, 1) }), Parent = TopAccent })
+
+	--// Sidebar ------------------------------------------------------
+	local Sidebar = New("Frame", {
+		Name = "Sidebar",
+		Size = UDim2.new(0, SideW, 1, 0), BackgroundColor3 = Theme.Sidebar,
+		BorderSizePixel = 0, ZIndex = 2, Parent = Main,
+	})
+	Corner(Sidebar, 10)
+	local SidebarFlat = New("Frame", { Size = UDim2.new(0, 10, 1, 0), Position = UDim2.new(1, -10, 0, 0),
+		BackgroundColor3 = Theme.Sidebar, BorderSizePixel = 0, ZIndex = 2, Parent = Sidebar })
+
+	local LogoBoxSize = IsMobile and 34 or 42
+	local SideLogoBox = New("Frame", {
+		Size = UDim2.fromOffset(LogoBoxSize, LogoBoxSize),
+		Position = UDim2.new(0.5, -LogoBoxSize / 2, 0, 8),
+		BackgroundColor3 = Theme.Body, BorderSizePixel = 0, ZIndex = 3, Parent = Sidebar,
+	})
+	Corner(SideLogoBox, IsMobile and 10 or 12)
+	local SideLogoStroke = Stroke(SideLogoBox, Theme.Accent, 2)
+
+	local SideLogoImg = New("ImageLabel", {
+		Size = UDim2.new(1, -8, 1, -8), Position = UDim2.fromOffset(4, 4),
+		BackgroundTransparency = 1, Image = Logo, ScaleType = Enum.ScaleType.Fit,
+		ZIndex = 4, Parent = SideLogoBox,
+	})
+
+	local SideDivTop = New("Frame", {
+		Size = UDim2.new(1, -12, 0, 1), Position = UDim2.new(0, 6, 0, LogoBoxSize + 14),
+		BackgroundColor3 = Theme.Border, BorderSizePixel = 0, ZIndex = 3, Parent = Sidebar,
+	})
+
+	local TabBtnList = New("ScrollingFrame", {
+		Name = "Tabs",
+		Size = UDim2.new(1, 0, 1, -(LogoBoxSize + 24)),
+		Position = UDim2.new(0, 0, 0, LogoBoxSize + 20),
+		BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 0,
+		CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ZIndex = 3, Parent = Sidebar,
+	})
+	List(TabBtnList, IsMobile and 4 or 6, Enum.FillDirection.Vertical, Enum.HorizontalAlignment.Center)
+	Pad(TabBtnList, 4, 8, 0, 0)
+
+	--// Content ------------------------------------------------------
+	local ContentArea = New("Frame", {
+		Name = "Content",
+		Size = UDim2.new(1, -SideW, 1, 0), Position = UDim2.new(0, SideW, 0, 0),
+		BackgroundTransparency = 1, ZIndex = 2, Parent = Main,
+	})
+	Pad(ContentArea, IsMobile and 10 or 16, IsMobile and 10 or 14,
+		IsMobile and 10 or 18, IsMobile and 10 or 18)
+
+	local Header = New("Frame", {
+		Name = "Header",
+		Size = UDim2.new(1, 0, 0, IsMobile and 30 or 36), BackgroundTransparency = 1,
+		Active = true, ZIndex = 3, Parent = ContentArea,
+	})
+
+	local HLeft = New("Frame", { Size = UDim2.new(0.42, 0, 1, 0), BackgroundTransparency = 1,
+		Active = true, ZIndex = 3, Parent = Header })
+	List(HLeft, 6, Enum.FillDirection.Horizontal, Enum.HorizontalAlignment.Left, Enum.VerticalAlignment.Center)
+
+	local HeaderTitle = New("TextLabel", {
+		Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = "Home",
+		TextColor3 = Theme.TextPrimary, Font = Enum.Font.GothamBold,
+		TextSize = IsMobile and 14 or 17, TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd, LayoutOrder = 1, ZIndex = 3, Parent = HLeft,
+	})
+
+	local HRight = New("Frame", {
+		Size = UDim2.new(0.58, 0, 1, 0), Position = UDim2.new(0.42, 0, 0, 0),
+		BackgroundTransparency = 1, ZIndex = 3, Parent = Header,
+	})
+	List(HRight, IsMobile and 4 or 6, Enum.FillDirection.Horizontal,
+		Enum.HorizontalAlignment.Right, Enum.VerticalAlignment.Center)
+
+	local HBtnSize = IsMobile and 26 or 30
+	local HeaderButtons = {}
+	local function MkHBtn(label, lo)
+		local b = New("TextButton", {
+			Size = UDim2.fromOffset(HBtnSize, HBtnSize),
+			BackgroundColor3 = Theme.Search, Text = label,
+			TextColor3 = Theme.TextSecondary, Font = Enum.Font.GothamBold,
+			TextSize = IsMobile and 11 or 13, AutoButtonColor = false,
+			LayoutOrder = lo, ZIndex = 4, Parent = HRight,
+		})
+		Corner(b, 7)
+		local s = Stroke(b, Theme.Border, 1)
+		table.insert(HeaderButtons, { btn = b, stroke = s })
+		return b
+	end
+
+	local ThemeBtn = MkHBtn("🎨", 2)
+	local SearchBtn = MkHBtn("🔍", 3)
+	local SaveBtn   = MkHBtn("💾", 4)
+	local HideBtn   = MkHBtn("✕", 5) -- FIX: mobile users have no keyboard toggle
+
+	local SearchBar = New("Frame", {
+		Size = UDim2.fromOffset(0, HBtnSize), BackgroundColor3 = Theme.Search,
+		ClipsDescendants = true, Visible = false, LayoutOrder = 1, ZIndex = 4, Parent = HRight,
+	})
+	Corner(SearchBar, HBtnSize / 2)
+	local SearchBox = New("TextBox", {
+		Size = UDim2.new(1, -20, 1, 0), Position = UDim2.fromOffset(10, 0),
+		BackgroundTransparency = 1, Text = "", PlaceholderText = "Search...",
+		TextColor3 = Theme.TextPrimary, PlaceholderColor3 = Theme.TextSecondary,
+		Font = Theme.Font, TextSize = 12, ClearTextOnFocus = false,
+		TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 5, Parent = SearchBar,
+	})
+
+	local HDivider = New("Frame", {
+		Size = UDim2.new(1, 0, 0, 1), Position = UDim2.new(0, 0, 0, IsMobile and 38 or 46),
+		BackgroundColor3 = Theme.Border, BorderSizePixel = 0, ZIndex = 3, Parent = ContentArea,
+	})
+
+	local TabContainer = New("Frame", {
+		Name = "Pages",
+		Size = UDim2.new(1, 0, 1, -(IsMobile and 48 or 58)),
+		Position = UDim2.new(0, 0, 0, IsMobile and 48 or 58),
+		BackgroundTransparency = 1, ZIndex = 2, Parent = ContentArea,
+	})
+
+	--// ── Window dragging (FIX #1) ─────────────────────────────────
+	-- v3.1 used UIDragDetector, which does not exist on many clients (the
+	-- script died right there) and made the whole window a drag surface, so
+	-- sliders/toggles fought the drag. Header-only manual drag instead.
+	do
+		local dragging, dragStartPos, windowStart = false, nil, nil
+
+		local function beginDrag(input)
+			dragging = true
+			dragStartPos = Vector2.new(input.Position.X, input.Position.Y)
+			windowStart = Vector2.new(Main.AbsolutePosition.X, Main.AbsolutePosition.Y)
+		end
+
+		local function dragZone(inst)
+			if not inst then return end
+			inst.InputBegan:Connect(function(input)
+				if input.UserInputType == Enum.UserInputType.MouseButton1
+					or input.UserInputType == Enum.UserInputType.Touch then
+					beginDrag(input)
+				end
+			end)
+		end
+		dragZone(Header)
+		dragZone(HLeft)
+		dragZone(SideLogoBox)
+
+		Bind(UserInputService.InputChanged, function(input)
+			if not dragging then return end
+			if input.UserInputType ~= Enum.UserInputType.MouseMovement
+				and input.UserInputType ~= Enum.UserInputType.Touch then return end
+			local vp = Viewport()
+			local delta = Vector2.new(input.Position.X, input.Position.Y) - dragStartPos
+			local size = Main.AbsoluteSize
+			local nx = math.clamp(windowStart.X + delta.X, 0, math.max(0, vp.X - size.X))
+			local ny = math.clamp(windowStart.Y + delta.Y, 0, math.max(0, vp.Y - size.Y))
+			Main.Position = UDim2.fromOffset(nx, ny)
+		end)
+
+		Bind(UserInputService.InputEnded, function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = false
+			end
+		end)
+	end
+
+	--// ── Home page ────────────────────────────────────────────────
+	local HomePage = New("Frame", {
+		Name = "Home", Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1,
+		Visible = true, ZIndex = 3, Parent = TabContainer,
+	})
+
+	local HomeScroll = New("ScrollingFrame", {
+		Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1,
+		BorderSizePixel = 0, ScrollBarThickness = 0,
+		CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ZIndex = 3, Parent = HomePage,
+	})
+	List(HomeScroll, IsMobile and 8 or 14, Enum.FillDirection.Vertical,
+		Enum.HorizontalAlignment.Center, Enum.VerticalAlignment.Top)
+	Pad(HomeScroll, IsMobile and 8 or 18, 20, 0, 0)
+
+	local LogoSz = IsMobile and 68 or 104
+	local HomeLogoBox = New("Frame", {
+		Size = UDim2.fromOffset(LogoSz, LogoSz), BackgroundColor3 = Theme.Body,
+		LayoutOrder = 1, ZIndex = 4, Parent = HomeScroll,
+	})
+	Corner(HomeLogoBox, IsMobile and 16 or 22)
+	local HomeLogoStroke = Stroke(HomeLogoBox, Theme.Accent, 2)
+	local HomeLogoImg = New("ImageLabel", {
+		Size = UDim2.new(1, -12, 1, -12), Position = UDim2.fromOffset(6, 6),
+		BackgroundTransparency = 1, Image = Logo, ScaleType = Enum.ScaleType.Fit,
+		ZIndex = 5, Parent = HomeLogoBox,
+	})
+
+	local HomeTitleLbl = New("TextLabel", {
+		Size = UDim2.new(1, 0, 0, IsMobile and 22 or 32), BackgroundTransparency = 1,
+		Text = Title, TextColor3 = Theme.TextPrimary, Font = Enum.Font.GothamBold,
+		TextSize = IsMobile and 18 or 26, TextXAlignment = Enum.TextXAlignment.Center,
+		LayoutOrder = 2, ZIndex = 4, Parent = HomeScroll,
+	})
+	local HomeSubLbl = New("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 18), BackgroundTransparency = 1, Text = SubTitle,
+		TextColor3 = Theme.TextSecondary, Font = Theme.Font,
+		TextSize = IsMobile and 11 or 13, TextXAlignment = Enum.TextXAlignment.Center,
+		LayoutOrder = 3, ZIndex = 4, Parent = HomeScroll,
+	})
+	local HomeVerLbl = New("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1,
+		Text = "v" .. tostring(Version) .. "  ·  " .. Library.CurrentTheme,
+		TextColor3 = Theme.TextSecondary, Font = Enum.Font.Code, TextSize = 10,
+		TextXAlignment = Enum.TextXAlignment.Center, LayoutOrder = 4, ZIndex = 4, Parent = HomeScroll,
+	})
+
+	local InfoCard = New("Frame", {
+		Size = UDim2.new(0.9, 0, 0, 60), BackgroundColor3 = Theme.Search,
+		LayoutOrder = 5, ZIndex = 4, Parent = HomeScroll,
+	})
+	Corner(InfoCard, 8)
+	local InfoStroke = Stroke(InfoCard, Theme.Border, 1)
+	Pad(InfoCard, 8, 8, 12, 12)
+	local InfoLayout = List(InfoCard, 3, Enum.FillDirection.Vertical,
+		Enum.HorizontalAlignment.Left, Enum.VerticalAlignment.Center)
+
+	local InfoLabels = {}
+	local function InfoRow(label, value)
+		local rf = New("Frame", { Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1, ZIndex = 5, Parent = InfoCard })
+		List(rf, 6, Enum.FillDirection.Horizontal, Enum.HorizontalAlignment.Left, Enum.VerticalAlignment.Center)
+		local a = New("TextLabel", { Size = UDim2.new(0, 74, 1, 0), BackgroundTransparency = 1, Text = label,
+			TextColor3 = Theme.TextSecondary, Font = Theme.Font, TextSize = 10,
+			TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = 1, ZIndex = 5, Parent = rf })
+		local b = New("TextLabel", { Size = UDim2.new(1, -80, 1, 0), BackgroundTransparency = 1, Text = value,
+			TextColor3 = Theme.TextPrimary, Font = Enum.Font.GothamBold, TextSize = 10,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = 2, ZIndex = 5, Parent = rf })
+		table.insert(InfoLabels, { key = a, val = b })
+	end
+	InfoRow("User:",  LocalPlayer and LocalPlayer.Name or "Unknown")
+	InfoRow("ID:",    tostring(LocalPlayer and LocalPlayer.UserId or 0))
+	InfoRow("Place:", tostring(game.PlaceId))
+	InfoLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+		InfoCard.Size = UDim2.new(0.9, 0, 0, InfoLayout.AbsoluteContentSize.Y + 20)
+	end)
+
+	--// ── Search results page ──────────────────────────────────────
+	local SearchContent = New("ScrollingFrame", {
+		Name = "SearchResults",
+		Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, BorderSizePixel = 0,
+		ScrollBarThickness = 3, ScrollBarImageColor3 = Theme.Border,
+		CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		Visible = false, ZIndex = 3, Parent = TabContainer,
+	})
+	List(SearchContent, 4)
+	Pad(SearchContent, 0, 8, 0, 10)
+
+	-- FIX #18: the empty-state belongs to the results page
+	local NoResults = New("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 40), BackgroundTransparency = 1,
+		Text = "No results found", TextColor3 = Theme.TextSecondary,
+		Font = Theme.Font, TextSize = 14, Visible = false, ZIndex = 4, Parent = SearchContent,
+	})
+
+	--// ── Theme popup ──────────────────────────────────────────────
+	local ThemePopup = New("ScrollingFrame", {
+		Name = "ThemePicker",
+		Size = UDim2.fromOffset(IsMobile and 170 or 200, 0), BackgroundColor3 = Theme.Main,
+		Visible = false, ClipsDescendants = true, ZIndex = 9000, BorderSizePixel = 0,
+		ScrollBarThickness = 3, ScrollBarImageColor3 = Theme.Border,
+		CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		Parent = ScreenGui,
+	})
+	local ThemePopupW = IsMobile and 170 or 200
+	Corner(ThemePopup, 8)
+	local TPStroke = Stroke(ThemePopup, Theme.Border, 1)
+	Pad(ThemePopup, 4, 4, 4, 4)
+	List(ThemePopup, 2)
+
+	local TSearchF = New("Frame", {
+		Size = UDim2.new(1, 0, 0, 26), BackgroundColor3 = Theme.Search,
+		LayoutOrder = 0, ZIndex = 9001, Parent = ThemePopup,
+	})
+	Corner(TSearchF, 5)
+	local TSearchBox = New("TextBox", {
+		Size = UDim2.new(1, -12, 1, 0), Position = UDim2.fromOffset(6, 0),
+		BackgroundTransparency = 1, Text = "", PlaceholderText = "Filter themes...",
+		TextColor3 = Theme.TextPrimary, PlaceholderColor3 = Theme.TextSecondary,
+		Font = Theme.Font, TextSize = 11, ClearTextOnFocus = false, ZIndex = 9002, Parent = TSearchF,
+	})
+
+	local tOptBtns = {}
+	local tPopOpen = false
+	local ThemeDropdownRef = nil -- config-tab dropdown, kept in sync
+
+	local function SyncThemeOptionVisuals()
+		for tName, tb in pairs(tOptBtns) do
+			local active = (tName == Library.CurrentTheme)
+			tb.btn.BackgroundColor3 = Theme.Accent
+			tb.btn.BackgroundTransparency = active and 0.8 or 1
+			tb.lbl.TextColor3 = active and Theme.Accent or Theme.TextPrimary
+		end
+	end
+
+	local function CloseThemePopup()
+		if not tPopOpen then return end
+		tPopOpen = false
+		Tw(ThemePopup, { Size = UDim2.fromOffset(ThemePopupW, 0) }, TS)
+		task.delay(0.3, function()
+			if not tPopOpen then ThemePopup.Visible = false end
+		end)
+	end
+
+	local function ApplyTheme(name, fromDropdown)
+		if not Library:SetTheme(name) then return end
+		HomeVerLbl.Text = "v" .. tostring(Version) .. "  ·  " .. Library.CurrentTheme
+		SyncThemeOptionVisuals()
+		if ThemeDropdownRef and not fromDropdown then
+			pcall(function() ThemeDropdownRef:SetValue(name, true) end)
+		end
+	end
+
+	for _, tName in ipairs(Library:GetThemes()) do
+		local isCur = (tName == Library.CurrentTheme)
+		local tOpt = New("TextButton", {
+			Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = Theme.Accent,
+			BackgroundTransparency = isCur and 0.8 or 1, Text = "",
+			AutoButtonColor = false, LayoutOrder = 1, ZIndex = 9001, Parent = ThemePopup,
+		})
+		Corner(tOpt, 5)
+		Pad(tOpt, 0, 0, 8, 8)
+
+		local tDot = New("Frame", {
+			Size = UDim2.fromOffset(8, 8), Position = UDim2.new(0, 8, 0.5, -4),
+			BackgroundColor3 = Themes[tName].Accent, BorderSizePixel = 0, ZIndex = 9002, Parent = tOpt,
+		})
+		Corner(tDot, 4)
+
+		local tLbl = New("TextLabel", {
+			Size = UDim2.new(1, -22, 1, 0), Position = UDim2.fromOffset(22, 0),
+			BackgroundTransparency = 1, Text = tName,
+			TextColor3 = isCur and Theme.Accent or Theme.TextPrimary,
+			Font = Theme.Font, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+			ZIndex = 9002, Parent = tOpt,
+		})
+
+		tOpt.MouseEnter:Connect(function()
+			if Library.CurrentTheme ~= tName then Tw(tOpt, { BackgroundTransparency = 0.88 }, TF) end
+		end)
+		tOpt.MouseLeave:Connect(function()
+			if Library.CurrentTheme ~= tName then Tw(tOpt, { BackgroundTransparency = 1 }, TF) end
+		end)
+		tOpt.MouseButton1Click:Connect(function()
+			ApplyTheme(tName)
+			Notify({ Title = "Theme", Content = "Applied: " .. tName, Type = "Success", Duration = 2 })
+			CloseThemePopup()
+		end)
+
+		tOptBtns[tName] = { btn = tOpt, lbl = tLbl, dot = tDot }
+	end
+
+	TSearchBox:GetPropertyChangedSignal("Text"):Connect(function()
+		local q = string.lower(TSearchBox.Text)
+		for tName, tb in pairs(tOptBtns) do
+			tb.btn.Visible = q == "" or string.find(string.lower(tostring(tName)), q, 1, true) ~= nil
+		end
+	end)
+
+	ThemeBtn.MouseButton1Click:Connect(function()
+		if tPopOpen then
+			CloseThemePopup()
+			return
+		end
+		tPopOpen = true
+		local bp  = ThemeBtn.AbsolutePosition
+		local bs  = ThemeBtn.AbsoluteSize
+		local vp  = Viewport()
+		local cnt = #Library:GetThemes()
+		local tgt = math.min(cnt * 32 + 36, math.max(140, vp.Y * 0.5))
+		local X   = bp.X - ThemePopupW + bs.X
+		local Y   = bp.Y + bs.Y + 4
+		X = math.clamp(X, 5, math.max(5, vp.X - ThemePopupW - 5))
+		if Y + tgt > vp.Y - 10 then Y = math.max(5, bp.Y - tgt - 4) end
+		ThemePopup.Position = UDim2.fromOffset(X, Y)
+		ThemePopup.Visible = true
+		Tw(ThemePopup, { Size = UDim2.fromOffset(ThemePopupW, tgt) }, TS)
+	end)
+
+	--// FIX #5 + #7: one handler, and it reacts to touch as well as mouse.
+	local function PointInside(point, guiObject)
+		local p, s = guiObject.AbsolutePosition, guiObject.AbsoluteSize
+		return point.X >= p.X and point.X <= p.X + s.X and point.Y >= p.Y and point.Y <= p.Y + s.Y
+	end
+
+	Bind(UserInputService.InputBegan, function(inp)
+		if inp.UserInputType ~= Enum.UserInputType.MouseButton1
+			and inp.UserInputType ~= Enum.UserInputType.Touch then return end
+		if not tPopOpen then return end
+		local mp = Vector2.new(inp.Position.X, inp.Position.Y)
+		if not PointInside(mp, ThemePopup) and not PointInside(mp, ThemeBtn) then
+			CloseThemePopup()
+		end
+	end)
+
+	--// ── Window object ────────────────────────────────────────────
+	local Win = {
+		ScreenGui = ScreenGui, Main = Main, Tabs = {}, AllRows = {},
+		CurrentTab = nil, Watermarks = {}, Popups = { { Close = CloseThemePopup } },
+		Visible = true, Title = Title,
+	}
+	table.insert(Library.Windows, Win)
+
+	local function ClosePopups()
+		for _, p in ipairs(Win.Popups) do
+			if type(p.Close) == "function" then pcall(p.Close) end
+		end
+	end
+
+	function Win:ToggleVisibility(force)
+		local target = force
+		if target == nil then target = not self.Visible end
+		if target == self.Visible then return end
+		self.Visible = target
+		if target then
+			Main.Visible = true
+			SetFade(Main, 1)
+			TwFade(Main, 0, TS)
+		else
+			ClosePopups()
+			TwFade(Main, 1, TS)
+			task.delay(0.3, function()
+				if not self.Visible then Main.Visible = false end
+			end)
+		end
+		for _, wm in ipairs(self.Watermarks) do wm:UpdatePosition() end
+	end
+	Win.Toggle = Win.ToggleVisibility
+	function Win:Show() self:ToggleVisibility(true) end
+	function Win:Hide() self:ToggleVisibility(false) end
+
+	HideBtn.MouseButton1Click:Connect(function() Win:Hide() end)
+
+	Bind(UserInputService.InputBegan, function(inp, processed)
+		if processed then return end
+		local key = Library.ToggleKey
+		if not key then return end
+		if inp.KeyCode == key or inp.UserInputType == key then
+			Win:ToggleVisibility()
+		end
+	end)
+
+	--// FIX #9: keep the window inside the screen when it rotates/resizes
+	local function ApplyResponsive()
+		local nw, nh = TargetSize()
+		W, H = nw, nh
+		Main.Size = UDim2.fromOffset(W, H)
+		local vp = Viewport()
+		local p = Main.AbsolutePosition
+		Main.Position = UDim2.fromOffset(
+			math.clamp(p.X, 0, math.max(0, vp.X - W)),
+			math.clamp(p.Y, 0, math.max(0, vp.Y - H))
+		)
+		ClosePopups()
+	end
+	local cam = GetCamera()
+	if cam then Bind(cam:GetPropertyChangedSignal("ViewportSize"), ApplyResponsive) end
+
+	--// ── Search behaviour (FIX #18) ───────────────────────────────
+	local searchVisible = false
+	SearchBtn.MouseButton1Click:Connect(function()
+		searchVisible = not searchVisible
+		if searchVisible then
+			SearchBar.Visible = true
+			Tw(SearchBar, { Size = UDim2.fromOffset(IsMobile and 120 or 170, HBtnSize) }, TS)
+			task.defer(function() pcall(function() SearchBox:CaptureFocus() end) end)
+		else
+			SearchBox.Text = ""
+			Tw(SearchBar, { Size = UDim2.fromOffset(0, HBtnSize) }, TS)
+			task.delay(0.3, function()
+				if not searchVisible then SearchBar.Visible = false end
+			end)
+		end
+	end)
+
+	local function RestoreRows()
+		for _, c in ipairs(Win.AllRows) do
+			if c.Row and c.Row.Parent ~= c.OriginalParent then
+				c.Row.Parent = c.OriginalParent
+			end
+		end
+	end
+
+	SearchBox:GetPropertyChangedSignal("Text"):Connect(function()
+		local q = string.lower(SearchBox.Text)
+		RestoreRows()
+
+		if q == "" then
+			SearchContent.Visible = false
+			NoResults.Visible = false
+			if Win.CurrentTab then
+				Win.CurrentTab.Canvas.Visible = true
+				HeaderTitle.Text = Win.CurrentTab.Title
+				HomePage.Visible = false
+			else
+				HomePage.Visible = true
+				HeaderTitle.Text = "Home"
+			end
+			return
+		end
+
+		for _, t in ipairs(Win.Tabs) do t.Canvas.Visible = false end
+		HomePage.Visible = false
+		SearchContent.Visible = true
+		HeaderTitle.Text = "Search"
+
+		local found = 0
+		for _, c in ipairs(Win.AllRows) do
+			local hay = string.lower(c.Title .. " " .. (c.Desc or "") .. " " .. (c.Tab or ""))
+			if string.find(hay, q, 1, true) then
+				c.Row.Parent = SearchContent
+				found += 1
+			end
+		end
+		NoResults.Visible = (found == 0)
+	end)
+
+	--// ── Watermark ────────────────────────────────────────────────
+	function Win:Watermark(initText)
+		local wf = New("Frame", {
+			BackgroundColor3 = Theme.Main, Size = UDim2.fromOffset(0, 26),
+			ClipsDescendants = true, ZIndex = 9500, Parent = ScreenGui,
+		})
+		Corner(wf, 6)
+		local ws = Stroke(wf, Theme.Border, 1)
+		local wTop = New("Frame", { Size = UDim2.new(1, 0, 0, 1), BackgroundColor3 = Theme.Accent,
+			BorderSizePixel = 0, ZIndex = 9501, Parent = wf })
+		New("UIGradient", { Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.1, 0),
+			NumberSequenceKeypoint.new(0.9, 0), NumberSequenceKeypoint.new(1, 1) }), Parent = wTop })
+		local wTxt = New("TextLabel", {
+			Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1,
+			Text = initText or "", RichText = true, TextColor3 = Theme.TextPrimary,
+			Font = Enum.Font.Code, TextSize = 12, ZIndex = 9502, Parent = wf,
+		})
+		Pad(wTxt, 0, 0, 10, 10)
+
+		OnTheme(function()
+			wf.BackgroundColor3 = Theme.Main
+			ws.Color = Theme.Border
+			wTop.BackgroundColor3 = Theme.Accent
+			wTxt.TextColor3 = Theme.TextPrimary
+		end, wf)
+
+		local wmO = { Frame = wf, Pos = "TopLeft", Text = initText or "" }
+		function wmO:UpdateSize()
+			local clean = tostring(self.Text):gsub("<[^>]->", "")
+			local w = TextWidth(clean, 12, Enum.Font.Code)
+			wf.Size = UDim2.fromOffset(w + 20, 26)
+		end
+		function wmO:UpdatePosition()
+			local mp, ms = Main.AbsolutePosition, Main.AbsoluteSize
+			local wsz = wf.AbsoluteSize
+			local pd = 6
+			local posTbl
+			if Win.Visible then
+				posTbl = {
+					TopLeft     = { UDim2.fromOffset(mp.X, mp.Y - wsz.Y - pd), Vector2.new(0, 0) },
+					TopRight    = { UDim2.fromOffset(mp.X + ms.X, mp.Y - wsz.Y - pd), Vector2.new(1, 0) },
+					BottomLeft  = { UDim2.fromOffset(mp.X, mp.Y + ms.Y + pd), Vector2.new(0, 0) },
+					BottomRight = { UDim2.fromOffset(mp.X + ms.X, mp.Y + ms.Y + pd), Vector2.new(1, 0) },
+				}
+			else
+				posTbl = {
+					TopLeft     = { UDim2.new(0, 8, 0, 8), Vector2.new(0, 0) },
+					TopRight    = { UDim2.new(1, -8, 0, 8), Vector2.new(1, 0) },
+					BottomLeft  = { UDim2.new(0, 8, 1, -8), Vector2.new(0, 1) },
+					BottomRight = { UDim2.new(1, -8, 1, -8), Vector2.new(1, 1) },
+				}
+			end
+			local p = posTbl[self.Pos] or posTbl.TopLeft
+			wf.Position = p[1]
+			wf.AnchorPoint = p[2]
+		end
+		function wmO:SetText(t) self.Text = t; wTxt.Text = t; self:UpdateSize(); self:UpdatePosition() end
+		function wmO:SetPosition(p) self.Pos = p; self:UpdatePosition() end
+		function wmO:SetVisible(v) wf.Visible = v end
+		function wmO:Destroy() wf:Destroy() end
+		wf:GetPropertyChangedSignal("AbsoluteSize"):Connect(function() wmO:UpdatePosition() end)
+		Main:GetPropertyChangedSignal("AbsolutePosition"):Connect(function() wmO:UpdatePosition() end)
+		Main:GetPropertyChangedSignal("AbsoluteSize"):Connect(function() wmO:UpdatePosition() end)
+		wmO:UpdateSize()
+		wmO:SetPosition("TopLeft")
+		task.defer(function() wmO:UpdatePosition() end)
+		table.insert(Win.Watermarks, wmO)
+		return wmO
+	end
+
+	function Win:SetLogo(image)
+		SideLogoImg.Image = image
+		HomeLogoImg.Image = image
+		if self.FloatingButton then self.FloatingButton:SetLogo(image) end
+	end
+	function Win:SetTitle(t)
+		Title = t
+		HomeTitleLbl.Text = t
+		if self.FloatingButton then self.FloatingButton:SetTitle(t) end
+	end
+	function Win:SetSubTitle(t) HomeSubLbl.Text = t end
+
+	--// ── Global theme repaint ─────────────────────────────────────
+	OnTheme(function()
+		Main.BackgroundColor3        = Theme.Main
+		MainStroke.Color             = Theme.Border
+		TopAccent.BackgroundColor3   = Theme.Accent
+		Sidebar.BackgroundColor3     = Theme.Sidebar
+		SidebarFlat.BackgroundColor3 = Theme.Sidebar
+		SideLogoBox.BackgroundColor3 = Theme.Body
+		SideLogoStroke.Color         = Theme.Accent
+		SideDivTop.BackgroundColor3  = Theme.Border
+		HeaderTitle.TextColor3       = Theme.TextPrimary
+		HDivider.BackgroundColor3    = Theme.Border
+		SearchBar.BackgroundColor3   = Theme.Search
+		SearchBox.TextColor3         = Theme.TextPrimary
+		SearchBox.PlaceholderColor3  = Theme.TextSecondary
+		SearchContent.ScrollBarImageColor3 = Theme.Border
+		NoResults.TextColor3         = Theme.TextSecondary
+		ThemePopup.BackgroundColor3  = Theme.Main
+		TPStroke.Color               = Theme.Border
+		TSearchF.BackgroundColor3    = Theme.Search
+		TSearchBox.TextColor3        = Theme.TextPrimary
+		TSearchBox.PlaceholderColor3 = Theme.TextSecondary
+		HomeLogoBox.BackgroundColor3 = Theme.Body
+		HomeLogoStroke.Color         = Theme.Accent
+		HomeTitleLbl.TextColor3      = Theme.TextPrimary
+		HomeSubLbl.TextColor3        = Theme.TextSecondary
+		HomeVerLbl.TextColor3        = Theme.TextSecondary
+		InfoCard.BackgroundColor3    = Theme.Search
+		InfoStroke.Color             = Theme.Border
+		HomeVerLbl.Text = "v" .. tostring(Version) .. "  ·  " .. Library.CurrentTheme
+		for _, l in ipairs(InfoLabels) do
+			l.key.TextColor3 = Theme.TextSecondary
+			l.val.TextColor3 = Theme.TextPrimary
+		end
+		for _, h in ipairs(HeaderButtons) do
+			h.btn.BackgroundColor3 = Theme.Search
+			h.btn.TextColor3 = Theme.TextSecondary
+			h.stroke.Color = Theme.Border
+		end
+		SyncThemeOptionVisuals()
+	end, Main)
+
+	--// ── Sidebar HOME button (FIX #10) ────────────────────────────
+	local HomeBtnSize = IsMobile and 34 or 42
+	local HomeBtn = New("TextButton", {
+		Name = "HomeButton",
+		Size = UDim2.fromOffset(HomeBtnSize, HomeBtnSize),
+		BackgroundColor3 = Theme.Accent, BackgroundTransparency = 0.78,
+		Text = "⌂", TextColor3 = Theme.TextPrimary, Font = Enum.Font.GothamBold,
+		TextSize = IsMobile and 16 or 18, AutoButtonColor = false,
+		LayoutOrder = -1, ZIndex = 4, Parent = TabBtnList,
+	})
+	Corner(HomeBtn, 10)
+
+	local function ShowHome()
+		SearchBox.Text = ""
+		for _, t in ipairs(Win.Tabs) do
+			t.Canvas.Visible = false
+			SetFade(t.Canvas, 1)
+			t:SetButtonActive(false)
+		end
+		Win.CurrentTab = nil
+		HomePage.Visible = true
+		SearchContent.Visible = false
+		HeaderTitle.Text = "Home"
+		Tw(HomeBtn, { BackgroundTransparency = 0.78 }, TF)
+		Tw(SaveBtn, { BackgroundColor3 = Theme.Search }, TF)
+	end
+	HomeBtn.MouseButton1Click:Connect(ShowHome)
+	Win.ShowHome = ShowHome
+
+	OnTheme(function()
+		HomeBtn.BackgroundColor3 = Theme.Accent
+		HomeBtn.TextColor3 = Theme.TextPrimary
+	end, HomeBtn)
+
+	--// ============================================================
+	--//  TAB
+	--// ============================================================
+	function Win:Tab(tabOpts)
+		tabOpts = tabOpts or {}
+		local TabTitle = tabOpts.Title    or "Tab"
+		local TabIcon  = tabOpts.Icon     or ""
+		local IsConfig = tabOpts.IsConfig or false
+
+		local BtnSz = IsMobile and 34 or 42
+
+		local TabBtn = New("TextButton", {
+			Name = TabTitle,
+			Size = UDim2.fromOffset(BtnSz, BtnSz),
+			BackgroundColor3 = Theme.Sidebar, BackgroundTransparency = 1,
+			Text = "", AutoButtonColor = false, ZIndex = 4,
+			Parent = (not IsConfig) and TabBtnList or nil,
+		})
+		Corner(TabBtn, 10)
+
+		local TabBtnBg = New("Frame", {
+			Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = Theme.Accent,
+			BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 4, Parent = TabBtn,
+		})
+		Corner(TabBtnBg, 10)
+
+		local TabBtnImg = New("ImageLabel", {
+			Size = UDim2.fromOffset(IsMobile and 18 or 20, IsMobile and 18 or 20),
+			Position = UDim2.new(0.5, 0, 0.5, 0), AnchorPoint = Vector2.new(0.5, 0.5),
+			BackgroundTransparency = 1, Image = TabIcon, ImageColor3 = Theme.TextSecondary,
+			ZIndex = 5, Parent = TabBtn,
+		})
+
+		-- fallback initial when no icon is supplied
+		local TabBtnFallback = New("TextLabel", {
+			Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1,
+			Text = (TabIcon == "" and TabTitle:sub(1, 1):upper() or ""),
+			TextColor3 = Theme.TextSecondary, Font = Enum.Font.GothamBold,
+			TextSize = IsMobile and 14 or 16, ZIndex = 5, Parent = TabBtn,
+		})
+
+		local ActiveBar = New("Frame", {
+			Size = UDim2.fromOffset(3, 20), Position = UDim2.new(1, 2, 0.5, -10),
+			BackgroundColor3 = Theme.Accent, BackgroundTransparency = 1,
+			BorderSizePixel = 0, ZIndex = 4, Parent = TabBtn,
+		})
+		Corner(ActiveBar, 2)
+
+		local TTFrame = New("Frame", {
+			Size = UDim2.fromOffset(0, 22), Position = UDim2.new(1, 8, 0.5, -11),
+			BackgroundColor3 = Theme.Sidebar, Visible = false, ClipsDescendants = true,
+			ZIndex = 9900, Parent = TabBtn,
+		})
+		Corner(TTFrame, 5)
+		local TTStroke = Stroke(TTFrame, Theme.Border, 1)
+		local TTLbl = New("TextLabel", {
+			Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = TabTitle,
+			TextColor3 = Theme.TextPrimary, Font = Theme.Font, TextSize = 11,
+			ZIndex = 9901, Parent = TTFrame,
+		})
+		Pad(TTLbl, 0, 0, 7, 7)
+
+		TabBtn.MouseEnter:Connect(function()
+			if IsMobile then return end
+			TTFrame.Visible = true
+			local w = TextWidth(TabTitle, 11, Theme.Font)
+			Tw(TTFrame, { Size = UDim2.fromOffset(w + 14, 22) }, TF)
+		end)
+		TabBtn.MouseLeave:Connect(function()
+			Tw(TTFrame, { Size = UDim2.fromOffset(0, 22) }, TF)
+			task.delay(0.15, function() TTFrame.Visible = false end)
+		end)
+
+		local Canvas = New(CanvasClass, {
+			Name = TabTitle .. "Page",
+			Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1,
+			GroupTransparency = 1, Visible = false, ZIndex = 3, Parent = TabContainer,
+		})
+
+		local Scroll = New("ScrollingFrame", {
+			Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, BorderSizePixel = 0,
+			ScrollBarThickness = 3, ScrollBarImageColor3 = Theme.Border,
+			CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			ZIndex = 4, Parent = Canvas,
+		})
+		List(Scroll, 4)
+		Pad(Scroll, 0, 10, 0, 8)
+
+		local TabObj = {
+			Canvas = Canvas, Scroll = Scroll, TabButton = TabBtn,
+			Title = TabTitle, Icon = TabIcon, IsConfig = IsConfig, LayoutOrder = 0,
+			Components = {},
+		}
+		table.insert(Win.Tabs, TabObj)
+
+		--// FIX #4: one place that owns the active/inactive look, so leaving a
+		--// tab really turns its indicator bar off again.
+		function TabObj:SetButtonActive(active)
+			if IsConfig then
+				Tw(SaveBtn, { BackgroundColor3 = active and Theme.Accent or Theme.Search }, TF)
+				return
+			end
+			if active then
+				Tw(TabBtnBg, { BackgroundColor3 = Theme.Accent, BackgroundTransparency = 0.78 }, TF)
+				Tw(TabBtnImg, { ImageColor3 = Color3.new(1, 1, 1) }, TF)
+				Tw(TabBtnFallback, { TextColor3 = Theme.TextPrimary }, TF)
+				ActiveBar.BackgroundColor3 = Theme.Accent
+				ActiveBar.BackgroundTransparency = 0
+			else
+				Tw(TabBtnBg, { BackgroundTransparency = 1 }, TF)
+				Tw(TabBtnImg, { ImageColor3 = Theme.TextSecondary }, TF)
+				Tw(TabBtnFallback, { TextColor3 = Theme.TextSecondary }, TF)
+				ActiveBar.BackgroundTransparency = 1
+			end
+		end
+
+		OnTheme(function()
+			TTFrame.BackgroundColor3 = Theme.Sidebar
+			TTStroke.Color = Theme.Border
+			TTLbl.TextColor3 = Theme.TextPrimary
+			Scroll.ScrollBarImageColor3 = Theme.Border
+			TabObj:SetButtonActive(Win.CurrentTab == TabObj)
+		end, Canvas)
+
+		local function ActivateTab()
+			if Win.CurrentTab == TabObj and SearchBox.Text == "" then return end
+			if SearchBox.Text ~= "" then SearchBox.Text = "" end
+
+			HomePage.Visible = false
+			SearchContent.Visible = false
+			Tw(HomeBtn, { BackgroundTransparency = 1 }, TF)
+
+			for _, t in ipairs(Win.Tabs) do
+				if t ~= TabObj then
+					if t == Win.CurrentTab then
+						TwFade(t.Canvas, 1, TS)
+						local closing = t
+						task.delay(0.3, function()
+							if Win.CurrentTab ~= closing then closing.Canvas.Visible = false end
+						end)
+					else
+						t.Canvas.Visible = false
+						SetFade(t.Canvas, 1)
+					end
+					t:SetButtonActive(false)
+				end
+			end
+
+			Canvas.Visible = true
+			SetFade(Canvas, Win.CurrentTab and 1 or 0)
+			TwFade(Canvas, 0, TS)
+			TabObj:SetButtonActive(true)
+
+			Win.CurrentTab = TabObj
+			HeaderTitle.Text = TabTitle
+		end
+
+		function TabObj:Activate() ActivateTab() end
+		TabBtn.MouseButton1Click:Connect(ActivateTab)
+
+		--// Row helper -----------------------------------------------
+		local function CreateRow(rTitle, rH, rDesc)
+			TabObj.LayoutOrder += 1
+			local row = New("Frame", {
+				Size = UDim2.new(1, 0, 0, rH or 52), BackgroundTransparency = 1,
+				LayoutOrder = TabObj.LayoutOrder, ZIndex = 4, Parent = Scroll,
+			})
+			local sep = New("Frame", {
+				Size = UDim2.new(1, -8, 0, 1), Position = UDim2.new(0, 8, 1, -1),
+				BackgroundColor3 = Theme.Border, BorderSizePixel = 0, ZIndex = 4, Parent = row,
+			})
+			OnTheme(function() sep.BackgroundColor3 = Theme.Border end, sep)
+			table.insert(Win.AllRows, {
+				Row = row, OriginalParent = Scroll,
+				Title = rTitle or "", Desc = rDesc or "", Tab = TabTitle,
+			})
+			return row
+		end
+
+		local function RegisterFlag(flagName, obj, default)
+			obj.Flag = flagName
+			obj.Default = default
+			Library.Flags[flagName] = obj
+			table.insert(TabObj.Components, obj)
+			return obj
+		end
+
+		--// SECTION ---------------------------------------------------
+		function TabObj:Section(sOpts)
+			sOpts = type(sOpts) == "string" and { Title = sOpts } or (sOpts or {})
+			local sTitle = sOpts.Title or "Section"
+			TabObj.LayoutOrder += 1
+			local sf = New("Frame", { Size = UDim2.new(1, 0, 0, 28), BackgroundTransparency = 1,
+				LayoutOrder = TabObj.LayoutOrder, ZIndex = 4, Parent = Scroll })
+			local sBar = New("Frame", { Size = UDim2.fromOffset(3, 14), Position = UDim2.new(0, 4, 0.5, -7),
+				BackgroundColor3 = Theme.Accent, BorderSizePixel = 0, ZIndex = 4, Parent = sf })
+			Corner(sBar, 2)
+			local sLbl = New("TextLabel", {
+				Size = UDim2.new(1, -14, 1, 0), Position = UDim2.fromOffset(12, 0),
+				BackgroundTransparency = 1, Text = string.upper(sTitle),
+				TextColor3 = Theme.Accent, Font = Enum.Font.GothamBold,
+				TextSize = IsMobile and 10 or 11, TextXAlignment = Enum.TextXAlignment.Left,
+				ZIndex = 4, Parent = sf,
+			})
+			OnTheme(function()
+				sBar.BackgroundColor3 = Theme.Accent
+				sLbl.TextColor3 = Theme.Accent
+			end, sf)
+			return { Frame = sf, SetTitle = function(t) sLbl.Text = string.upper(tostring(t)) end }
+		end
+
+		--// DIVIDER ---------------------------------------------------
+		function TabObj:Divider()
+			TabObj.LayoutOrder += 1
+			local df = New("Frame", { Size = UDim2.new(1, 0, 0, 1), BackgroundColor3 = Theme.Border,
+				BorderSizePixel = 0, LayoutOrder = TabObj.LayoutOrder, ZIndex = 4, Parent = Scroll })
+			OnTheme(function() df.BackgroundColor3 = Theme.Border end, df)
+			return df
+		end
+
+		--// SPACE -----------------------------------------------------
+		function TabObj:Space(h)
+			TabObj.LayoutOrder += 1
+			return New("Frame", { Size = UDim2.new(1, 0, 0, h or 8), BackgroundTransparency = 1,
+				LayoutOrder = TabObj.LayoutOrder, ZIndex = 4, Parent = Scroll })
+		end
+
+		--// LABEL -----------------------------------------------------
+		function TabObj:Label(lOpts)
+			lOpts = type(lOpts) == "string" and { Text = lOpts } or (lOpts or {})
+			local text = lOpts.Text or lOpts.Title or ""
+			TabObj.LayoutOrder += 1
+			local lf = New("Frame", { Size = UDim2.new(1, 0, 0, 22), BackgroundTransparency = 1,
+				LayoutOrder = TabObj.LayoutOrder, ZIndex = 4, Parent = Scroll })
+			local ll = New("TextLabel", {
+				Size = UDim2.new(1, -8, 1, 0), Position = UDim2.fromOffset(4, 0),
+				BackgroundTransparency = 1, Text = text, RichText = true,
+				TextColor3 = Theme.TextSecondary, Font = Theme.Font,
+				TextSize = IsMobile and 11 or 12, TextXAlignment = Enum.TextXAlignment.Left,
+				TextWrapped = true, ZIndex = 4, Parent = lf,
+			})
+			OnTheme(function()
+				ll.TextColor3 = Theme.TextSecondary
+				ll.Font = Theme.Font
+			end, lf)
+			return { Frame = lf, SetText = function(t) ll.Text = tostring(t) end }
+		end
+
+		--// PARAGRAPH -------------------------------------------------
+		function TabObj:Paragraph(pOpts)
+			pOpts = pOpts or {}
+			local pTitle   = pOpts.Title   or ""
+			local pContent = pOpts.Content or ""
+			TabObj.LayoutOrder += 1
+			local pf = New("Frame", {
+				Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+				BackgroundColor3 = Theme.Search, LayoutOrder = TabObj.LayoutOrder,
+				ZIndex = 4, Parent = Scroll,
+			})
+			Corner(pf, 8)
+			local pStroke = Stroke(pf, Theme.Border, 1)
+			Pad(pf, 8, 8, 10, 10)
+			List(pf, 4)
+			local ptl = New("TextLabel", { Size = UDim2.new(1, 0, 0, 16), BackgroundTransparency = 1,
+				Text = pTitle, TextColor3 = Theme.TextPrimary, Font = Enum.Font.GothamBold,
+				TextSize = IsMobile and 12 or 13, TextXAlignment = Enum.TextXAlignment.Left,
+				LayoutOrder = 1, ZIndex = 4, Parent = pf })
+			local pcl = New("TextLabel", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+				BackgroundTransparency = 1, Text = pContent, RichText = true,
+				TextColor3 = Theme.TextSecondary, Font = Theme.Font,
+				TextSize = IsMobile and 10 or 11, TextXAlignment = Enum.TextXAlignment.Left,
+				TextWrapped = true, LayoutOrder = 2, ZIndex = 4, Parent = pf })
+			OnTheme(function()
+				pf.BackgroundColor3 = Theme.Search
+				pStroke.Color = Theme.Border
+				ptl.TextColor3 = Theme.TextPrimary
+				pcl.TextColor3 = Theme.TextSecondary
+			end, pf)
+			return {
+				Frame = pf,
+				SetTitle = function(t) ptl.Text = tostring(t) end,
+				SetContent = function(c) pcl.Text = tostring(c) end,
+			}
+		end
+
+		--// TOGGLE ----------------------------------------------------
+		function TabObj:Toggle(tOpts)
+			tOpts = tOpts or {}                       -- FIX #16
+			local compTitle = tOpts.Title    or "Toggle"
+			local Default   = tOpts.Default and true or false
+			local Desc      = tOpts.Description
+			local Callback  = tOpts.Callback or function() end
+			local FlagName  = tOpts.Flag     or (TabTitle .. "/" .. compTitle)
+
+			local rowH = Desc and (IsMobile and 54 or 62) or (IsMobile and 42 or 50)
+			local Row  = CreateRow(compTitle, rowH, Desc)
+			local State = Default
+
+			local PillW = IsMobile and 36 or 40
+			local PillH = IsMobile and 20 or 22
+			local CircleSz = PillH - 4
+
+			local TextArea = New("Frame", {
+				Size = UDim2.new(1, -(PillW + 26), 1, 0), Position = UDim2.fromOffset(6, 0),
+				BackgroundTransparency = 1, ZIndex = 5, Parent = Row,
+			})
+			List(TextArea, 2, Enum.FillDirection.Vertical, Enum.HorizontalAlignment.Left, Enum.VerticalAlignment.Center)
+
+			local TLbl = New("TextLabel", {
+				Size = UDim2.new(1, 0, 0, IsMobile and 16 or 18),
+				BackgroundTransparency = 1, Text = compTitle,
+				TextColor3 = Theme.TextPrimary, Font = Theme.Font,
+				TextSize = IsMobile and 12 or 14, TextXAlignment = Enum.TextXAlignment.Left,
+				TextTruncate = Enum.TextTruncate.AtEnd, LayoutOrder = 1, ZIndex = 5, Parent = TextArea,
+			})
+			local DLbl
+			if Desc then
+				DLbl = New("TextLabel", {
+					Size = UDim2.new(1, 0, 0, 12), BackgroundTransparency = 1, Text = Desc,
+					TextColor3 = Theme.TextSecondary, Font = Theme.Font,
+					TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left,
+					TextTruncate = Enum.TextTruncate.AtEnd, LayoutOrder = 2, ZIndex = 5, Parent = TextArea,
+				})
+			end
+
+			local Pill = New("Frame", {
+				Size = UDim2.fromOffset(PillW, PillH),
+				Position = UDim2.new(1, -(PillW + 8), 0.5, -(PillH / 2)),
+				BackgroundColor3 = State and Theme.Accent or Theme.Border,
+				BorderSizePixel = 0, ZIndex = 5, Parent = Row,
+			})
+			Corner(Pill, PillH / 2)
+
+			local Circle = New("Frame", {
+				Size = UDim2.fromOffset(CircleSz, CircleSz),
+				Position = State and UDim2.fromOffset(PillW - CircleSz - 2, 2) or UDim2.fromOffset(2, 2),
+				BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, ZIndex = 6, Parent = Pill,
+			})
+			Corner(Circle, CircleSz / 2)
+
+			-- whole row is tappable: much friendlier on phones
+			local ToggleBtn = New("TextButton", {
+				Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1,
+				Text = "", AutoButtonColor = false, ZIndex = 7, Parent = Row,
+			})
+
+			local function SetState(s, fire)
+				State = s and true or false
+				Tw(Pill, { BackgroundColor3 = State and Theme.Accent or Theme.Border }, TF)
+				Tw(Circle, {
+					Position = State and UDim2.fromOffset(PillW - CircleSz - 2, 2) or UDim2.fromOffset(2, 2),
+				}, TF)
+				if fire then
+					local ok, err = pcall(Callback, State)
+					if not ok then warn(("[PXHub] toggle %q callback error: %s"):format(compTitle, tostring(err))) end
+				end
+			end
+
+			ToggleBtn.MouseButton1Click:Connect(function() SetState(not State, true) end)
+
+			OnTheme(function()
+				TLbl.TextColor3 = Theme.TextPrimary
+				if DLbl then DLbl.TextColor3 = Theme.TextSecondary end
+				Tw(Pill, { BackgroundColor3 = State and Theme.Accent or Theme.Border }, TF)
+			end, Row)
+
+			local obj = {}
+			function obj:GetComponentType() return "Toggle" end
+			function obj:GetValue() return State end
+			function obj:SetValue(v, silent) SetState(v, not silent) end
+			function obj:SetTitle(t) TLbl.Text = tostring(t) end
+			function obj:SetDescription(t) if DLbl then DLbl.Text = tostring(t) end end
+			function obj:Reset() SetState(Default, true) end
+
+			-- FIX #16: honour a `true` default by firing the callback once
+			if Default and tOpts.FireOnLoad ~= false then
+				task.defer(function() SetState(true, true) end)
+			end
+
+			return RegisterFlag(FlagName, obj, Default)
+		end
+
+		--// BUTTON ----------------------------------------------------
+		function TabObj:Button(bOpts)
+			bOpts = bOpts or {}
+			local compTitle = bOpts.Title    or "Button"
+			local Action    = bOpts.Action   or "Click"
+			local Desc      = bOpts.Description
+			local Callback  = bOpts.Callback or function() end
+			local FlagName  = bOpts.Flag     or (TabTitle .. "/" .. compTitle)
+
+			local rowH = Desc and (IsMobile and 54 or 62) or (IsMobile and 42 or 50)
+			local Row  = CreateRow(compTitle, rowH, Desc)
+
+			local TLbl = New("TextLabel", {
+				Size = UDim2.new(1, -150, 0, IsMobile and 16 or 18),
+				Position = UDim2.fromOffset(6, Desc and (IsMobile and 8 or 10) or 0),
+				BackgroundTransparency = 1, Text = compTitle,
+				TextColor3 = Theme.TextPrimary, Font = Theme.Font,
+				TextSize = IsMobile and 12 or 14, TextXAlignment = Enum.TextXAlignment.Left,
+				TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 5, Parent = Row,
+			})
+			if not Desc then TLbl.Size = UDim2.new(1, -150, 1, 0) end
+			local DLbl
+			if Desc then
+				DLbl = New("TextLabel", {
+					Size = UDim2.new(1, -150, 0, 12), Position = UDim2.fromOffset(6, IsMobile and 26 or 30),
+					BackgroundTransparency = 1, Text = Desc, TextColor3 = Theme.TextSecondary,
+					Font = Theme.Font, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left,
+					TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 5, Parent = Row,
+				})
+			end
+
+			local Btn = New("TextButton", {
+				Size = UDim2.fromOffset(0, IsMobile and 26 or 30),
+				Position = UDim2.new(1, -6, 0.5, 0), AnchorPoint = Vector2.new(1, 0.5),
+				AutomaticSize = Enum.AutomaticSize.X,
+				BackgroundColor3 = Theme.Accent, Text = Action,
+				TextColor3 = ContrastOn(Theme.Accent), -- FIX #13
+				Font = Enum.Font.GothamBold,
+				TextSize = IsMobile and 11 or 12, AutoButtonColor = false,
+				ZIndex = 5, Parent = Row,
+			})
+			Corner(Btn, 7)
+			Pad(Btn, 0, 0, 12, 12)
+
+			Btn.MouseEnter:Connect(function() Tw(Btn, { BackgroundTransparency = 0.15 }, TF) end)
+			Btn.MouseLeave:Connect(function() Tw(Btn, { BackgroundTransparency = 0 }, TF) end)
+
+			local busy = false
+			Btn.MouseButton1Click:Connect(function()
+				if busy then return end
+				busy = true
+				local orig = Btn.Text
+				Btn.Text = "✓"
+				Tw(Btn, { BackgroundColor3 = Color3.fromRGB(46, 200, 110) }, TF)
+				task.delay(0.35, function()
+					Btn.Text = orig
+					Tw(Btn, { BackgroundColor3 = Theme.Accent }, TF)
+					busy = false
+				end)
+				local ok, err = pcall(Callback)
+				if not ok then
+					warn(("[PXHub] button %q callback error: %s"):format(compTitle, tostring(err)))
+					Notify({ Title = "Error", Content = tostring(err), Type = "Error", Duration = 4 })
+				end
+			end)
+
+			OnTheme(function()
+				TLbl.TextColor3 = Theme.TextPrimary
+				if DLbl then DLbl.TextColor3 = Theme.TextSecondary end
+				Btn.BackgroundColor3 = Theme.Accent
+				Btn.TextColor3 = ContrastOn(Theme.Accent)
+			end, Row)
+
+			local obj = {}
+			function obj:GetComponentType() return "Button" end
+			function obj:Fire() Callback() end
+			function obj:SetTitle(t) TLbl.Text = tostring(t) end
+			function obj:SetAction(a) Btn.Text = tostring(a) end
+			return RegisterFlag(FlagName, obj, nil)
+		end
+
+		--// SLIDER ----------------------------------------------------
+		function TabObj:Slider(sOpts)
+			sOpts = sOpts or {}
+			local compTitle = sOpts.Title    or "Slider"
+			local Min       = tonumber(sOpts.Min) or 0
+			local Max       = tonumber(sOpts.Max) or 100
+			local Decimal   = tonumber(sOpts.Decimal) or 0
+			local Suffix    = sOpts.Suffix   or ""
+			local Prefix    = sOpts.Prefix   or ""
+			local Dual      = sOpts.Dual     or false
+			local Step      = tonumber(sOpts.Step)
+			local Callback  = sOpts.Callback or function() end
+			local FlagName  = sOpts.Flag     or (TabTitle .. "/" .. compTitle)
+			if Max <= Min then Max = Min + 1 end  -- FIX: divide-by-zero in UpdVis
+
+			local DefaultVal
+			if Dual then
+				DefaultVal = type(sOpts.Default) == "table"
+					and { math.clamp(sOpts.Default[1] or Min, Min, Max), math.clamp(sOpts.Default[2] or Max, Min, Max) }
+					or { Min, Max }
+			else
+				DefaultVal = math.clamp(tonumber(sOpts.Default) or Min, Min, Max)
+			end
+			local CurVal = Dual and { DefaultVal[1], DefaultVal[2] } or DefaultVal
+
+			local Row = CreateRow(compTitle, IsMobile and 46 or 52, sOpts.Description)
+
+			local TrackW = IsMobile and 104 or 150
+			local labelW = IsMobile and 90 or 130
+
+			local TLbl = New("TextLabel", {
+				Size = UDim2.new(0, labelW, 1, 0), Position = UDim2.fromOffset(6, 0),
+				BackgroundTransparency = 1, Text = compTitle,
+				TextColor3 = Theme.TextPrimary, Font = Theme.Font,
+				TextSize = IsMobile and 12 or 14, TextXAlignment = Enum.TextXAlignment.Left,
+				TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 5, Parent = Row,
+			})
+
+			local ValLbl = New("TextLabel", {
+				Size = UDim2.new(1, -(labelW + TrackW + 24), 1, 0),
+				Position = UDim2.fromOffset(labelW + 12, 0),
+				BackgroundTransparency = 1, Text = "",
+				TextColor3 = Theme.Accent, Font = Enum.Font.Code,
+				TextSize = IsMobile and 10 or 12, TextXAlignment = Enum.TextXAlignment.Right,
+				TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 5, Parent = Row,
+			})
+
+			local TrackBtn = New("TextButton", {
+				Size = UDim2.fromOffset(TrackW, 20),
+				Position = UDim2.new(1, -(TrackW + 8), 0.5, -10),
+				BackgroundTransparency = 1, Text = "", AutoButtonColor = false, ZIndex = 5, Parent = Row,
+			})
+
+			local Track = New("Frame", {
+				Size = UDim2.new(1, 0, 0, 5), Position = UDim2.new(0, 0, 0.5, -2.5),
+				BackgroundColor3 = Theme.Border, BorderSizePixel = 0, ZIndex = 5, Parent = TrackBtn,
+			})
+			Corner(Track, 3)
+
+			local Fill = New("Frame", {
+				Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = Theme.Accent,
+				BorderSizePixel = 0, ZIndex = 6, Parent = Track,
+			})
+			Corner(Fill, 3)
+
+			local CircSz = IsMobile and 13 or 15
+			local H1 = New("Frame", {
+				Size = UDim2.fromOffset(CircSz, CircSz), AnchorPoint = Vector2.new(0.5, 0.5),
+				Position = UDim2.new(0, 0, 0.5, 0), BackgroundColor3 = Color3.new(1, 1, 1),
+				BorderSizePixel = 0, ZIndex = 7, Parent = Track,
+			})
+			Corner(H1, CircSz / 2)
+			--// FIX #3: keep ONE stroke per handle and recolour it on theme change
+			local H1Stroke = Stroke(H1, Theme.Accent, 2)
+
+			local H2, H2Stroke
+			if Dual then
+				H2 = New("Frame", {
+					Size = UDim2.fromOffset(CircSz, CircSz), AnchorPoint = Vector2.new(0.5, 0.5),
+					Position = UDim2.new(1, 0, 0.5, 0), BackgroundColor3 = Color3.new(1, 1, 1),
+					BorderSizePixel = 0, ZIndex = 7, Parent = Track,
+				})
+				Corner(H2, CircSz / 2)
+				H2Stroke = Stroke(H2, Theme.Accent, 2)
+			end
+
+			OnTheme(function()
+				TLbl.TextColor3 = Theme.TextPrimary
+				ValLbl.TextColor3 = Theme.Accent
+				Track.BackgroundColor3 = Theme.Border
+				Fill.BackgroundColor3 = Theme.Accent
+				H1Stroke.Color = Theme.Accent
+				if H2Stroke then H2Stroke.Color = Theme.Accent end
+			end, Row)
+
+			local function Fmt(v) return Prefix .. string.format("%." .. Decimal .. "f", v) .. Suffix end
+			local function SnapV(v)
+				v = tonumber(v) or Min
+				if not Step or Step <= 0 then return v end
+				return math.clamp(math.floor((v - Min) / Step + 0.5) * Step + Min, Min, Max)
+			end
+			local function UpdVis(v)
+				if Dual then
+					local a1 = math.clamp((v[1] - Min) / (Max - Min), 0, 1)
+					local a2 = math.clamp((v[2] - Min) / (Max - Min), 0, 1)
+					Tw(Fill, { Position = UDim2.new(a1, 0, 0, 0), Size = UDim2.new(a2 - a1, 0, 1, 0) }, T0)
+					Tw(H1, { Position = UDim2.new(a1, 0, 0.5, 0) }, T0)
+					if H2 then Tw(H2, { Position = UDim2.new(a2, 0, 0.5, 0) }, T0) end
+					ValLbl.Text = Fmt(v[1]) .. " – " .. Fmt(v[2])
+				else
+					local a = math.clamp((v - Min) / (Max - Min), 0, 1)
+					Tw(Fill, { Size = UDim2.new(a, 0, 1, 0) }, T0)
+					Tw(H1, { Position = UDim2.new(a, 0, 0.5, 0) }, T0)
+					ValLbl.Text = Fmt(v)
+				end
+			end
+			local function SetVal(v, fire)
+				if Dual then
+					local a = type(v) == "table" and v or { Min, Max }
+					CurVal = { math.clamp(SnapV(a[1] or Min), Min, Max), math.clamp(SnapV(a[2] or Max), Min, Max) }
+					if CurVal[1] > CurVal[2] then CurVal[1] = CurVal[2] end
+				else
+					CurVal = math.clamp(SnapV(v), Min, Max)
+				end
+				UpdVis(CurVal)
+				if fire then
+					local ok, err = pcall(Callback, CurVal)
+					if not ok then warn(("[PXHub] slider %q callback error: %s"):format(compTitle, tostring(err))) end
+				end
+			end
+
+			local dragging, activeHandle = false, 1
+			local function DoDrag(inp)
+				local sz = Track.AbsoluteSize.X
+				if sz <= 0 then return end
+				local rel = math.clamp((inp.Position.X - Track.AbsolutePosition.X) / sz, 0, 1)
+				local sv = SnapV(Min + rel * (Max - Min))
+				if Dual then
+					local nv = { CurVal[1], CurVal[2] }
+					nv[activeHandle] = sv
+					if activeHandle == 1 and nv[1] > nv[2] then nv[1] = nv[2]
+					elseif activeHandle == 2 and nv[2] < nv[1] then nv[2] = nv[1] end
+					CurVal = nv
+				else
+					CurVal = sv
+				end
+				UpdVis(CurVal)
+				pcall(Callback, CurVal)
+			end
+
+			TrackBtn.InputBegan:Connect(function(i)
+				if i.UserInputType ~= Enum.UserInputType.MouseButton1
+					and i.UserInputType ~= Enum.UserInputType.Touch then return end
+				dragging = true
+				if Dual then
+					local sz = Track.AbsoluteSize.X
+					local rel = sz > 0 and math.clamp((i.Position.X - Track.AbsolutePosition.X) / sz, 0, 1) or 0
+					local a1 = (CurVal[1] - Min) / (Max - Min)
+					local a2 = (CurVal[2] - Min) / (Max - Min)
+					activeHandle = math.abs(rel - a1) <= math.abs(rel - a2) and 1 or 2
+				end
+				DoDrag(i)
+				Tw((Dual and activeHandle == 2) and H2 or H1, { Size = UDim2.fromOffset(CircSz + 3, CircSz + 3) }, TF)
+			end)
+
+			Bind(UserInputService.InputEnded, function(i)
+				if not dragging then return end
+				if i.UserInputType == Enum.UserInputType.MouseButton1
+					or i.UserInputType == Enum.UserInputType.Touch then
+					dragging = false
+					Tw((Dual and activeHandle == 2) and H2 or H1, { Size = UDim2.fromOffset(CircSz, CircSz) }, TF)
+				end
+			end)
+
+			Bind(UserInputService.InputChanged, function(i)
+				if not dragging then return end
+				if i.UserInputType == Enum.UserInputType.MouseMovement
+					or i.UserInputType == Enum.UserInputType.Touch then
+					DoDrag(i)
+				end
+			end)
+
+			SetVal(CurVal, false)
+			if sOpts.FireOnLoad then task.defer(function() SetVal(CurVal, true) end) end
+
+			local obj = {}
+			function obj:GetComponentType() return "Slider" end
+			function obj:GetValue() return CurVal end
+			function obj:SetValue(v, silent) SetVal(v, not silent) end
+			function obj:SetMin(v) Min = tonumber(v) or Min; SetVal(CurVal, false) end
+			function obj:SetMax(v) Max = tonumber(v) or Max; SetVal(CurVal, false) end
+			function obj:Reset() SetVal(Dual and { DefaultVal[1], DefaultVal[2] } or DefaultVal, true) end
+			return RegisterFlag(FlagName, obj, DefaultVal)
+		end
+
+		--// DROPDOWN --------------------------------------------------
+		function TabObj:Dropdown(dOpts)
+			dOpts = dOpts or {}
+			local compTitle = dOpts.Title    or "Dropdown"
+			local Options   = dOpts.Options  or {}
+			local Multi     = dOpts.Multi    or false
+			local UseSearch = dOpts.Search   or false      -- FIX #6: actually implemented
+			local Default   = dOpts.Default
+			local Callback  = dOpts.Callback or function() end
+			local FlagName  = dOpts.Flag     or (TabTitle .. "/" .. compTitle)
+
+			local function DefaultSelection()
+				local sel = {}
+				if Multi then
+					if type(Default) == "table" then
+						for _, v in ipairs(Default) do table.insert(sel, v) end
+					end
+				else
+					if type(Default) == "string" and Default ~= "" then
+						table.insert(sel, Default)
+					elseif type(Default) == "table" and Default[1] then
+						table.insert(sel, Default[1])
+					end
+				end
+				return sel
+			end
+
+			local SelItems = DefaultSelection()
+			local Row = CreateRow(compTitle, IsMobile and 46 or 52, dOpts.Description)
+
+			local BtnW = IsMobile and 140 or 185
+			local BtnH = IsMobile and 28 or 32
+
+			local TLbl = New("TextLabel", {
+				Size = UDim2.new(1, -(BtnW + 20), 1, 0), Position = UDim2.fromOffset(6, 0),
+				BackgroundTransparency = 1, Text = compTitle,
+				TextColor3 = Theme.TextPrimary, Font = Theme.Font,
+				TextSize = IsMobile and 12 or 14, TextXAlignment = Enum.TextXAlignment.Left,
+				TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 5, Parent = Row,
+			})
+
+			local DropBtn = New("TextButton", {
+				Size = UDim2.fromOffset(BtnW, BtnH),
+				Position = UDim2.new(1, -(BtnW + 6), 0.5, -(BtnH / 2)),
+				BackgroundColor3 = Theme.Search, Text = "", AutoButtonColor = false, ZIndex = 5, Parent = Row,
+			})
+			Corner(DropBtn, 7)
+			local DropStroke = Stroke(DropBtn, Theme.Border, 1)
+			Pad(DropBtn, 0, 0, 8, 8)
+
+			local DBInner = New("Frame", { Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, ZIndex = 5, Parent = DropBtn })
+			List(DBInner, 4, Enum.FillDirection.Horizontal, Enum.HorizontalAlignment.Left, Enum.VerticalAlignment.Center)
+
+			local DropText = New("TextLabel", {
+				Size = UDim2.new(1, -18, 1, 0), BackgroundTransparency = 1, Text = "Select...",
+				TextColor3 = Theme.TextSecondary, Font = Theme.Font,
+				TextSize = IsMobile and 11 or 12, TextXAlignment = Enum.TextXAlignment.Left,
+				TextTruncate = Enum.TextTruncate.AtEnd, LayoutOrder = 1, ZIndex = 5, Parent = DBInner,
+			})
+			local Chevron = New("TextLabel", {
+				Size = UDim2.fromOffset(14, 14), BackgroundTransparency = 1, Text = "▾",
+				TextColor3 = Theme.TextSecondary, Font = Enum.Font.GothamBold,
+				TextSize = 12, TextXAlignment = Enum.TextXAlignment.Right,
+				LayoutOrder = 2, ZIndex = 5, Parent = DBInner,
+			})
+
+			--// FIX #6: scrollable menu, so long option lists are reachable
+			local MenuW = IsMobile and 170 or 210
+			local Menu = New("ScrollingFrame", {
+				Name = compTitle .. "Menu",
+				Size = UDim2.fromOffset(MenuW, 0),
+				BackgroundColor3 = Theme.Main, Visible = false, ClipsDescendants = true,
+				BorderSizePixel = 0, ScrollBarThickness = 3, ScrollBarImageColor3 = Theme.Border,
+				CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+				ZIndex = 6000, Parent = ScreenGui,
+			})
+			Corner(Menu, 7)
+			local MenuStroke = Stroke(Menu, Theme.Border, 1)
+			Pad(Menu, 4, 4, 4, 4)
+			local MLayout = List(Menu, 2)
+
+			local MSearchF, MSearchBox
+			if UseSearch then
+				MSearchF = New("Frame", {
+					Size = UDim2.new(1, 0, 0, 26), BackgroundColor3 = Theme.Search,
+					LayoutOrder = 0, ZIndex = 6001, Parent = Menu,
+				})
+				Corner(MSearchF, 5)
+				MSearchBox = New("TextBox", {
+					Size = UDim2.new(1, -12, 1, 0), Position = UDim2.fromOffset(6, 0),
+					BackgroundTransparency = 1, Text = "", PlaceholderText = "Search...",
+					TextColor3 = Theme.TextPrimary, PlaceholderColor3 = Theme.TextSecondary,
+					Font = Theme.Font, TextSize = 11, ClearTextOnFocus = false,
+					ZIndex = 6002, Parent = MSearchF,
+				})
+			end
+
+			local OptBtns = {}
+			local IsOpen, RenderConn = false, nil
+
+			local function UpdateText()
+				if #SelItems == 0 then
+					DropText.Text = "Select..."
+					DropText.TextColor3 = Theme.TextSecondary
+				else
+					local s = table.concat(SelItems, ", ")
+					DropText.Text = s
+					DropText.TextColor3 = Theme.TextPrimary
+				end
+			end
+
+			local function MenuHeight()
+				local content = MLayout.AbsoluteContentSize.Y + 10
+				local vp = Viewport()
+				return math.clamp(content, 30, math.min(240, vp.Y * 0.45))
+			end
+
+			local function CloseMenu()
+				if not IsOpen then return end
+				IsOpen = false
+				Tw(Chevron, { Rotation = 0 }, TF)
+				Tw(DropStroke, { Color = Theme.Border }, TF)
+				Tw(Menu, { Size = UDim2.fromOffset(MenuW, 0) }, TS)
+				task.delay(0.3, function()
+					if not IsOpen then
+						Menu.Visible = false
+						if RenderConn then RenderConn:Disconnect(); RenderConn = nil end
+					end
+				end)
+			end
+
+			local function ApplyVisual(opt, selected)
+				local r = OptBtns[opt]
+				if not r then return end
+				r.ck.Visible = selected
+				Tw(r.f, { BackgroundTransparency = selected and 0.8 or 1 }, TF)
+				Tw(r.l, { TextColor3 = selected and Theme.Accent or Theme.TextPrimary }, TF)
+			end
+
+			local function BuildOpts(list)
+				for _, c in ipairs(Menu:GetChildren()) do
+					if c:IsA("Frame") and c ~= MSearchF then c:Destroy() end
+				end
+				table.clear(OptBtns)
+				for idx, opt in ipairs(list) do
+					local sel = table.find(SelItems, opt) ~= nil
+					local of = New("Frame", {
+						Size = UDim2.new(1, 0, 0, 28), BackgroundColor3 = Theme.Accent,
+						BackgroundTransparency = sel and 0.8 or 1, LayoutOrder = idx, ZIndex = 6001, Parent = Menu,
+					})
+					Corner(of, 5)
+					Pad(of, 0, 0, 8, 8)
+					local ol = New("TextLabel", {
+						Size = UDim2.new(1, -16, 1, 0), BackgroundTransparency = 1, Text = tostring(opt),
+						TextColor3 = sel and Theme.Accent or Theme.TextPrimary, Font = Theme.Font,
+						TextSize = IsMobile and 11 or 12, TextXAlignment = Enum.TextXAlignment.Left,
+						TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 6002, Parent = of,
+					})
+					local ck = New("ImageLabel", {
+						Size = UDim2.fromOffset(12, 12), Position = UDim2.new(1, -14, 0.5, -6),
+						BackgroundTransparency = 1, Image = "rbxassetid://10709790644",
+						ImageColor3 = Theme.Accent, Visible = sel, ZIndex = 6002, Parent = of,
+					})
+					local ob = New("TextButton", {
+						Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = "",
+						AutoButtonColor = false, ZIndex = 6003, Parent = of,
+					})
+
+					ob.MouseEnter:Connect(function()
+						if not table.find(SelItems, opt) then Tw(of, { BackgroundTransparency = 0.88 }, TF) end
+					end)
+					ob.MouseLeave:Connect(function()
+						if not table.find(SelItems, opt) then Tw(of, { BackgroundTransparency = 1 }, TF) end
+					end)
+					ob.MouseButton1Click:Connect(function()
+						if Multi then
+							local i = table.find(SelItems, opt)
+							if i then table.remove(SelItems, i) else table.insert(SelItems, opt) end
+							ApplyVisual(opt, table.find(SelItems, opt) ~= nil)
+							UpdateText()
+							pcall(Callback, SelItems)
+						else
+							local previous = SelItems[1]
+							table.clear(SelItems)
+							table.insert(SelItems, opt)
+							if previous then ApplyVisual(previous, false) end
+							ApplyVisual(opt, true)
+							UpdateText()
+							pcall(Callback, opt)
+							CloseMenu()
+						end
+					end)
+
+					OptBtns[opt] = { f = of, l = ol, ck = ck }
+				end
+			end
+
+			if MSearchBox then
+				MSearchBox:GetPropertyChangedSignal("Text"):Connect(function()
+					local q = string.lower(MSearchBox.Text)
+					for name, r in pairs(OptBtns) do
+						r.f.Visible = q == "" or string.find(string.lower(tostring(name)), q, 1, true) ~= nil
+					end
+				end)
+			end
+
+			BuildOpts(Options)
+			UpdateText()
+
+			local function UpdateMenuPosition()
+				local bp, bs = DropBtn.AbsolutePosition, DropBtn.AbsoluteSize
+				local vp = Viewport()
+				local tH = MenuHeight()
+				local x = math.clamp(bp.X, 4, math.max(4, vp.X - MenuW - 4))
+				local y = bp.Y + bs.Y + 4
+				if y + tH > vp.Y - 10 then y = math.max(4, bp.Y - tH - 4) end
+				Menu.Position = UDim2.fromOffset(x, y)
+			end
+
+			local function OpenMenu()
+				if IsOpen then return end
+				IsOpen = true
+				Tw(Chevron, { Rotation = 180 }, TF)
+				Tw(DropStroke, { Color = Theme.Accent }, TF)
+				UpdateMenuPosition()
+				Menu.Visible = true
+				Tw(Menu, { Size = UDim2.fromOffset(MenuW, MenuHeight()) }, TS)
+				if RenderConn then RenderConn:Disconnect() end
+				RenderConn = RunService.RenderStepped:Connect(UpdateMenuPosition)
+			end
+
+			DropBtn.MouseButton1Click:Connect(function()
+				if IsOpen then CloseMenu() else OpenMenu() end
+			end)
+
+			--// FIX #5: touch closes the menu too
+			Bind(UserInputService.InputBegan, function(i)
+				if i.UserInputType ~= Enum.UserInputType.MouseButton1
+					and i.UserInputType ~= Enum.UserInputType.Touch then return end
+				if not IsOpen then return end
+				local mp = Vector2.new(i.Position.X, i.Position.Y)
+				if not PointInside(mp, Menu) and not PointInside(mp, DropBtn) then CloseMenu() end
+			end)
+
+			OnTheme(function()
+				TLbl.TextColor3 = Theme.TextPrimary
+				DropBtn.BackgroundColor3 = Theme.Search
+				DropStroke.Color = Theme.Border
+				Menu.BackgroundColor3 = Theme.Main
+				MenuStroke.Color = Theme.Border
+				Menu.ScrollBarImageColor3 = Theme.Border
+				if MSearchF then
+					MSearchF.BackgroundColor3 = Theme.Search
+					MSearchBox.TextColor3 = Theme.TextPrimary
+					MSearchBox.PlaceholderColor3 = Theme.TextSecondary
+				end
+				UpdateText()
+				for name, r in pairs(OptBtns) do
+					local sel = table.find(SelItems, name) ~= nil
+					r.f.BackgroundColor3 = Theme.Accent
+					r.f.BackgroundTransparency = sel and 0.8 or 1
+					r.l.Font = Theme.Font
+					r.l.TextColor3 = sel and Theme.Accent or Theme.TextPrimary
+					r.ck.ImageColor3 = Theme.Accent
+				end
+			end, Row)
+
+			table.insert(Win.Popups, { Close = CloseMenu })
+
+			local obj = {}
+			function obj:GetComponentType() return "Dropdown" end
+			function obj:GetValue() return Multi and SelItems or SelItems[1] end
+			function obj:SetValue(val, silent)
+				table.clear(SelItems)
+				if Multi then
+					if type(val) == "table" then
+						for _, v in ipairs(val) do table.insert(SelItems, v) end
+					end
+				elseif val ~= nil then
+					table.insert(SelItems, val)
+				end
+				for name in pairs(OptBtns) do
+					ApplyVisual(name, table.find(SelItems, name) ~= nil)
+				end
+				UpdateText()
+				if not silent then pcall(Callback, Multi and SelItems or SelItems[1]) end
+			end
+			function obj:SetOptions(list)
+				Options = list or {}
+				BuildOpts(Options)
+				UpdateText()
+			end
+			function obj:AddOption(opt)
+				if not table.find(Options, opt) then
+					table.insert(Options, opt)
+					BuildOpts(Options)
+				end
+			end
+			function obj:RemoveOption(opt)
+				local i = table.find(Options, opt)
+				if not i then return end
+				table.remove(Options, i)
+				local si = table.find(SelItems, opt)
+				if si then table.remove(SelItems, si) end
+				BuildOpts(Options)
+				UpdateText()
+			end
+			function obj:GetOptions() return Options end
+			function obj:Open() OpenMenu() end
+			function obj:Close() CloseMenu() end
+			function obj:Clear() obj:SetValue(Multi and {} or nil) end
+			function obj:Reset() obj:SetValue(Multi and DefaultSelection() or DefaultSelection()[1], true) end
+			return RegisterFlag(FlagName, obj, Multi and DefaultSelection() or DefaultSelection()[1])
+		end
+
+		--// TEXTBOX ---------------------------------------------------
+		function TabObj:Textbox(txOpts)
+			txOpts = txOpts or {}
+			local compTitle = txOpts.Title       or "Textbox"
+			local Default   = txOpts.Default     or ""
+			local PH        = txOpts.Placeholder or "Type here..."
+			local Numeric   = txOpts.Numeric     or false
+			local Callback  = txOpts.Callback    or function() end
+			local FlagName  = txOpts.Flag        or (TabTitle .. "/" .. compTitle)
+
+			local Row = CreateRow(compTitle, IsMobile and 46 or 52, txOpts.Description)
+			local BoxW = IsMobile and 132 or 165
+			local BoxH = IsMobile and 28 or 32
+
+			local TLbl = New("TextLabel", {
+				Size = UDim2.new(1, -(BoxW + 20), 1, 0), Position = UDim2.fromOffset(6, 0),
+				BackgroundTransparency = 1, Text = compTitle,
+				TextColor3 = Theme.TextPrimary, Font = Theme.Font,
+				TextSize = IsMobile and 12 or 14, TextXAlignment = Enum.TextXAlignment.Left,
+				TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 5, Parent = Row,
+			})
+
+			local IWrap = New("Frame", {
+				Size = UDim2.fromOffset(BoxW, BoxH),
+				Position = UDim2.new(1, -(BoxW + 6), 0.5, -(BoxH / 2)),
+				BackgroundColor3 = Theme.Search, ZIndex = 5, Parent = Row,
+			})
+			Corner(IWrap, 7)
+			local IStroke = Stroke(IWrap, Theme.Border, 1)
+
+			local Input = New("TextBox", {
+				Size = UDim2.new(1, -16, 1, 0), Position = UDim2.fromOffset(8, 0),
+				BackgroundTransparency = 1, Text = tostring(Default), PlaceholderText = PH,
+				TextColor3 = Theme.TextPrimary, PlaceholderColor3 = Theme.TextSecondary,
+				Font = Enum.Font.Code, TextSize = IsMobile and 11 or 12,
+				TextXAlignment = Enum.TextXAlignment.Left, ClearTextOnFocus = false, ZIndex = 6, Parent = IWrap,
+			})
+
+			if Numeric then
+				Input:GetPropertyChangedSignal("Text"):Connect(function()
+					local cleaned = Input.Text:gsub("[^%d%.%-]", "")
+					if cleaned ~= Input.Text then Input.Text = cleaned end
+				end)
+			end
+
+			Input.Focused:Connect(function() Tw(IStroke, { Color = Theme.Accent }, TF) end)
+			Input.FocusLost:Connect(function(enter)
+				Tw(IStroke, { Color = Theme.Border }, TF)
+				pcall(Callback, Input.Text, enter)
+			end)
+
+			OnTheme(function()
+				TLbl.TextColor3 = Theme.TextPrimary
+				IWrap.BackgroundColor3 = Theme.Search
+				IStroke.Color = Theme.Border
+				Input.TextColor3 = Theme.TextPrimary
+				Input.PlaceholderColor3 = Theme.TextSecondary
+			end, Row)
+
+			local obj = {}
+			function obj:GetComponentType() return "Textbox" end
+			function obj:GetValue() return Input.Text end
+			function obj:SetValue(v, silent)
+				Input.Text = tostring(v)
+				if not silent then pcall(Callback, Input.Text, false) end
+			end
+			function obj:SetTitle(t) TLbl.Text = tostring(t) end
+			function obj:Reset() obj:SetValue(Default, true) end
+			return RegisterFlag(FlagName, obj, Default)
+		end
+
+		--// KEYBIND ---------------------------------------------------
+		function TabObj:Keybind(kOpts)
+			kOpts = kOpts or {}
+			local compTitle = kOpts.Title    or "Keybind"
+			local Default   = kOpts.Default
+			local Callback  = kOpts.Callback or function() end
+			local FlagName  = kOpts.Flag     or (TabTitle .. "/" .. compTitle)
+
+			local CurKey, Listening, ListenConn = Default, false, nil
+			local Row = CreateRow(compTitle, IsMobile and 44 or 50, kOpts.Description)
+
+			local TLbl = New("TextLabel", {
+				Size = UDim2.new(1, -150, 1, 0), Position = UDim2.fromOffset(6, 0),
+				BackgroundTransparency = 1, Text = compTitle,
+				TextColor3 = Theme.TextPrimary, Font = Theme.Font,
+				TextSize = IsMobile and 12 or 14, TextXAlignment = Enum.TextXAlignment.Left,
+				TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 5, Parent = Row,
+			})
+
+			local KBtn = New("TextButton", {
+				Size = UDim2.fromOffset(0, IsMobile and 24 or 28),
+				Position = UDim2.new(1, -6, 0.5, 0), AnchorPoint = Vector2.new(1, 0.5),
+				AutomaticSize = Enum.AutomaticSize.X,
+				BackgroundColor3 = Theme.Search, Text = FormatKey(Default),
+				TextColor3 = Theme.TextSecondary, Font = Enum.Font.Code,
+				TextSize = IsMobile and 11 or 12, AutoButtonColor = false, ZIndex = 5, Parent = Row,
+			})
+			Corner(KBtn, 6)
+			local KStroke = Stroke(KBtn, Theme.Border, 1)
+			Pad(KBtn, 0, 0, 10, 10)
+
+			local function StopListening()
+				Listening = false
+				KBtn.Text = FormatKey(CurKey)
+				Tw(KBtn, { TextColor3 = Theme.TextSecondary }, TF)
+				Tw(KStroke, { Color = Theme.Border }, TF)
+				if ListenConn then ListenConn:Disconnect(); ListenConn = nil end
+			end
+
+			KBtn.MouseButton1Click:Connect(function()
+				if Listening then StopListening(); return end
+				Listening = true
+				KBtn.Text = "..."
+				Tw(KBtn, { TextColor3 = Theme.Accent }, TF)
+				Tw(KStroke, { Color = Theme.Accent }, TF)
+				if ListenConn then ListenConn:Disconnect() end
+				ListenConn = UserInputService.InputBegan:Connect(function(i)
+					if i.UserInputType == Enum.UserInputType.Keyboard then
+						if i.KeyCode == Enum.KeyCode.Escape then
+							CurKey = nil
+						else
+							CurKey = i.KeyCode
+							pcall(Callback, CurKey)
+						end
+					elseif tostring(i.UserInputType):find("MouseButton") then
+						CurKey = i.UserInputType
+						pcall(Callback, CurKey)
+					else
+						return -- ignore touch/movement while binding
+					end
+					StopListening()
+				end)
+			end)
+
+			Bind(UserInputService.InputBegan, function(i, processed)
+				if processed or Listening or not CurKey then return end
+				if i.KeyCode == CurKey or i.UserInputType == CurKey then
+					pcall(Callback, CurKey)
+				end
+			end)
+
+			OnTheme(function()
+				TLbl.TextColor3 = Theme.TextPrimary
+				KBtn.BackgroundColor3 = Theme.Search
+				KBtn.TextColor3 = Listening and Theme.Accent or Theme.TextSecondary
+				KStroke.Color = Listening and Theme.Accent or Theme.Border
+			end, Row)
+
+			local obj = {}
+			function obj:GetComponentType() return "Keybind" end
+			function obj:GetValue() return CurKey end
+			function obj:SetValue(v, silent)
+				if type(v) == "string" and v ~= "None" then
+					local ok, key = pcall(function() return Enum.KeyCode[v] end)
+					if not ok or not key then
+						ok, key = pcall(function() return Enum.UserInputType[v] end)
+					end
+					v = ok and key or nil
+				elseif v == "None" then
+					v = nil
+				elseif v ~= nil and typeof(v) ~= "EnumItem" then
+					-- a corrupted config must not brick the keybind
+					warn("[PXHub] ignoring invalid keybind value: " .. tostring(v))
+					return
+				end
+				CurKey = v
+				KBtn.Text = FormatKey(v)
+				if not silent and v then pcall(Callback, v) end
+			end
+			function obj:Clear() CurKey = nil; KBtn.Text = "None" end
+			function obj:Reset() obj:SetValue(Default, true) end
+			return RegisterFlag(FlagName, obj, Default)
+		end
+
+		--// CODE ------------------------------------------------------
+		function TabObj:Code(cOpts)
+			cOpts = cOpts or {}
+			local code = cOpts.Code or ""
+			local lang = cOpts.Language or "Lua"
+			TabObj.LayoutOrder += 1
+			local cf = New("Frame", {
+				Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+				BackgroundColor3 = Theme.Body, LayoutOrder = TabObj.LayoutOrder, ZIndex = 4, Parent = Scroll,
+			})
+			Corner(cf, 8)
+			local cStroke = Stroke(cf, Theme.Border, 1)
+			local ch = New("Frame", { Size = UDim2.new(1, 0, 0, 24), BackgroundColor3 = Theme.Search,
+				BorderSizePixel = 0, ZIndex = 4, Parent = cf })
+			Corner(ch, 8)
+			local chFlat = New("Frame", { Size = UDim2.new(1, 0, 0.5, 0), Position = UDim2.new(0, 0, 0.5, 0),
+				BackgroundColor3 = Theme.Search, BorderSizePixel = 0, ZIndex = 4, Parent = ch })
+			local clang = New("TextLabel", { Size = UDim2.new(1, -60, 1, 0), Position = UDim2.fromOffset(8, 0),
+				BackgroundTransparency = 1, Text = lang, TextColor3 = Theme.TextSecondary,
+				Font = Enum.Font.Code, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 5, Parent = ch })
+			local cpb = New("TextButton", { Size = UDim2.fromOffset(38, 16), Position = UDim2.new(1, -44, 0.5, -8),
+				BackgroundColor3 = Theme.Border, Text = "Copy", TextColor3 = Theme.TextSecondary,
+				Font = Theme.Font, TextSize = 10, AutoButtonColor = false, ZIndex = 5, Parent = ch })
+			Corner(cpb, 4)
+			local ct = New("TextLabel", {
+				Size = UDim2.new(1, -16, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+				Position = UDim2.fromOffset(8, 30),
+				BackgroundTransparency = 1, Text = code, RichText = true,
+				TextColor3 = Theme.TextPrimary, Font = Enum.Font.Code, TextSize = 11,
+				TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+				TextWrapped = true, ZIndex = 5, Parent = cf,
+			})
+			Pad(cf, 0, 34, 0, 0)
+
+			cpb.MouseButton1Click:Connect(function()
+				local ok = pcall(function() setclipboard(code) end)
+				cpb.Text = ok and "✓" or "n/a"
+				task.delay(1.5, function() cpb.Text = "Copy" end)
+			end)
+
+			OnTheme(function()
+				cf.BackgroundColor3 = Theme.Body
+				cStroke.Color = Theme.Border
+				ch.BackgroundColor3 = Theme.Search
+				chFlat.BackgroundColor3 = Theme.Search
+				clang.TextColor3 = Theme.TextSecondary
+				ct.TextColor3 = Theme.TextPrimary
+				cpb.BackgroundColor3 = Theme.Border
+				cpb.TextColor3 = Theme.TextSecondary
+			end, cf)
+
+			return { Frame = cf, SetCode = function(c) code = c; ct.Text = c end }
+		end
+
+		return TabObj
+	end
+
+	--// ── CONFIG TAB ───────────────────────────────────────────────
+	local ConfigTab = Win:Tab({ Title = "Config", Icon = "rbxassetid://11419703493", IsConfig = true })
+	Win.ConfigTab = ConfigTab
+
+	ConfigTab:Paragraph({
+		Title = "Configuration",
+		Content = "Save, load and reset every toggle / slider / dropdown / textbox / keybind in this hub.",
+	})
+	ConfigTab:Section({ Title = "SAVE & LOAD" })
+
+	local function CollectConfig()
+		local data = { __theme = Library.CurrentTheme, __togglekey = FormatKey(Library.ToggleKey), values = {} }
+		for flag, comp in pairs(Library.Flags) do
+			if type(comp.GetValue) == "function" then
+				local ok, val = pcall(comp.GetValue, comp)
+				if ok then
+					local t = type(val)
+					-- EnumItem must be tested first: type() reports it as userdata/table
+					if typeof(val) == "EnumItem" then
+						data.values[flag] = val.Name
+					elseif t == "boolean" or t == "number" or t == "string" then
+						data.values[flag] = val
+					elseif t == "table" then
+						-- multi dropdown / dual slider
+						local clean = {}
+						for i, v in ipairs(val) do
+							if type(v) == "number" or type(v) == "string" then clean[i] = v end
+						end
+						data.values[flag] = clean
+					end
+				end
+			end
+		end
+		return data
+	end
+
+	local function FileExists(path)
+		if isfile then
+			local ok, res = pcall(isfile, path)
+			if ok then return res end
+		end
+		local ok = pcall(readfile, path)
+		return ok
+	end
+
+	ConfigTab:Button({
+		Title = "Save Config", Action = "Save",
+		Description = "Writes " .. Library.ConfigFile,
+		Callback = function()
+			local data = CollectConfig()
+			local ok, err = pcall(function()
+				writefile(Library.ConfigFile, HttpService:JSONEncode(data))
+			end)
+			if ok then
+				Notify({ Title = "Config Saved", Content = Library.ConfigFile, Type = "Success", Duration = 3 })
+			else
+				-- FIX #15: tell the user instead of silently doing nothing
+				Notify({ Title = "Save Failed",
+					Content = "This executor has no file access (" .. tostring(err) .. ")",
+					Type = "Error", Duration = 5 })
+			end
+		end,
+	})
+
+	local function LoadConfig(silent)
+		if not FileExists(Library.ConfigFile) then
+			if not silent then
+				Notify({ Title = "No Config Found", Content = "Save a config first.", Type = "Warning", Duration = 3 })
+			end
+			return false
+		end
+		local ok, data = pcall(function()
+			return HttpService:JSONDecode(readfile(Library.ConfigFile))
+		end)
+		if not ok or type(data) ~= "table" then
+			if not silent then
+				Notify({ Title = "Config Error", Content = "The config file is corrupted.", Type = "Error", Duration = 4 })
+			end
+			return false
+		end
+		local values = data.values or data -- accept v3.1 files too
+		for flag, v in pairs(values) do
+			local comp = Library.Flags[flag]
+			if comp and type(comp.SetValue) == "function" then
+				pcall(comp.SetValue, comp, v)
+			end
+		end
+		if data.__theme then ApplyTheme(data.__theme) end
+		if not silent then
+			Notify({ Title = "Config Loaded", Content = "Settings restored.", Type = "Success", Duration = 3 })
+		end
+		return true
+	end
+	Win.LoadConfig = function(_, silent) return LoadConfig(silent) end
+	Win.SaveConfig = function()
+		return pcall(function() writefile(Library.ConfigFile, HttpService:JSONEncode(CollectConfig())) end)
+	end
+
+	ConfigTab:Button({
+		Title = "Load Config", Action = "Load",
+		Callback = function() LoadConfig(false) end,
+	})
+
+	--// FIX #14: a reset that really resets
+	ConfigTab:Button({
+		Title = "Reset All", Action = "Reset",
+		Description = "Restores every component to its default value",
+		Callback = function()
+			local n = 0
+			for _, comp in pairs(Library.Flags) do
+				if type(comp.Reset) == "function" then
+					local ok = pcall(comp.Reset, comp)
+					if ok then n += 1 end
+				end
+			end
+			Notify({ Title = "Reset", Content = n .. " components restored to defaults.", Type = "Info", Duration = 3 })
+		end,
+	})
+
+	ConfigTab:Section({ Title = "THEME" })
+	ThemeDropdownRef = ConfigTab:Dropdown({
+		Title = "Theme", Options = Library:GetThemes(), Search = true,
+		Default = Library.CurrentTheme,
+		Callback = function(v)
+			if type(v) == "string" then ApplyTheme(v, true) end
+		end,
+	})
+
+	ConfigTab:Section({ Title = "INFO" })
+	local AboutPara = ConfigTab:Paragraph({
+		Title = "About",
+		Content = "Protocol X Hub v" .. tostring(Library.Version)
+			.. "\nToggle key: " .. FormatKey(Library.ToggleKey)
+			.. (IsMobile and "\nMobile layout active — use the floating button or ✕ to hide."
+				or "\nDrag the window by its header."),
+	})
+
+	ConfigTab:Keybind({
+		Title = "Toggle GUI Key", Default = Library.ToggleKey,
+		Callback = function(key)
+			Library.ToggleKey = key
+			AboutPara.SetContent("Protocol X Hub v" .. tostring(Library.Version)
+				.. "\nToggle key: " .. FormatKey(key))
+		end,
+	})
+
+	SaveBtn.MouseButton1Click:Connect(function() ConfigTab:Activate() end)
+
+	--// ── Optional floating button ─────────────────────────────────
+	if opts.FloatingButton ~= false and (IsMobile or opts.FloatingButton) then
+		Win.FloatingButton = CreateFloatingButton({
+			Logo = Logo, Title = Title,
+			OnClick = function() Win:ToggleVisibility() end,
+		})
+	end
+
+	--// ── Cleanup ──────────────────────────────────────────────────
+	function Win:Destroy()
+		ClosePopups()
+		for _, wm in ipairs(self.Watermarks) do pcall(function() wm:Destroy() end) end
+		if self.FloatingButton then pcall(function() self.FloatingButton:Destroy() end) end
+		ScreenGui:Destroy()
+		for i, w in ipairs(Library.Windows) do
+			if w == self then table.remove(Library.Windows, i); break end
+		end
+	end
+	Win.Unload = Win.Destroy
+
+	--// ── First paint ──────────────────────────────────────────────
+	task.defer(function()
+		if opts.StartTab ~= false then
+			for _, t in ipairs(Win.Tabs) do
+				if not t.IsConfig then
+					t:Activate()
+					break
+				end
+			end
+		end
+		if opts.LoadConfigOnStart then LoadConfig(true) end
+		task.delay(0.8, function()
+			Notify({
+				Title = Title,
+				Content = IsMobile
+					and "Loaded! Tap the floating button to show/hide."
+					or ("Loaded! Press " .. FormatKey(Library.ToggleKey) .. " to toggle."),
+				Type = "Success", Duration = 3,
+			})
+		end)
+	end)
+
+	return Win
+end
+
+--// ================================================================
+--//  GLOBAL CLEANUP
+--// ================================================================
+function Library:Unload()
+	for _, c in ipairs(Connections) do pcall(function() c:Disconnect() end) end
+	table.clear(Connections)
+	for i = #self.Windows, 1, -1 do
+		pcall(function() self.Windows[i]:Destroy() end)
+	end
+	if _FloatBtn then pcall(function() _FloatBtn:Destroy() end) end
+	if _NotifGui then pcall(function() _NotifGui:Destroy() end) end
+	table.clear(self.Flags)
+	table.clear(ThemeCBs)
+end
+
+return Library
